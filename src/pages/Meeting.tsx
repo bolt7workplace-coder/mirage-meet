@@ -7,26 +7,30 @@ import { useWebRTC } from '../hooks/useWebRTC';
 import { useFaceTransform } from '../hooks/useFaceTransform';
 import { socket } from '../lib/socket';
 import {
-  Video, VideoOff, Mic, MicOff, PhoneOff, Copy, Check, Users, PanelRightOpen
+  Video, VideoOff, Mic, MicOff, PhoneOff, Copy, Check, Users, PanelRightOpen, AlertCircle
 } from 'lucide-react';
 
 export default function Meeting() {
   const { roomId } = useParams<{ roomId: string }>();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const isHost = searchParams.get('host') === 'true';
+
+  // Determine if user is host (creating room) or joining via link
+  const isCreatingRoom = searchParams.get('host') === 'true';
+  const isJoiningRoom = searchParams.get('join') === 'true';
+
   const [isAdmin, setIsAdmin] = useState(false);
-  const [displayName, setDisplayName] = useState(() => searchParams.get('name') || (isHost ? 'Host' : 'Guest'));
+  const [displayName, setDisplayName] = useState(() => searchParams.get('name') || '');
   const [hasJoined, setHasJoined] = useState(false);
   const [meetingDuration, setMeetingDuration] = useState(0);
   const [showInvitePrompt, setShowInvitePrompt] = useState(false);
   const [copied, setCopied] = useState(false);
   const [panelCollapsed, setPanelCollapsed] = useState(false);
-  const [waitingForName, setWaitingForName] = useState(searchParams.get('join') === 'true');
-  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error'>('connecting');
+  const [needsNameInput, setNeedsNameInput] = useState(isJoiningRoom && !searchParams.get('name'));
+  const [error, setError] = useState<string | null>(null);
 
-  const transformInitializedRef = useRef(false);
   const processedStreamRef = useRef<MediaStream | null>(null);
+  const initializedRef = useRef(false);
 
   const {
     processedStream,
@@ -57,114 +61,118 @@ export default function Meeting() {
     cleanup,
   } = useWebRTC(roomId || null, processedStreamRef.current);
 
-  const displayNameRef = useRef<HTMLInputElement>(null);
+  const nameInputRef = useRef<HTMLInputElement>(null);
+  const actualLocalStream = processedStream || localStream;
 
-  const actualLocalStream = processedStreamRef.current || localStream;
-
+  // Connect socket on mount
   useEffect(() => {
     socket.connect();
+
+    socket.on('connect_error', (err) => {
+      console.error('Socket connection error:', err);
+      setError('Could not connect to server');
+    });
+
     return () => {
       socket.disconnect();
     };
   }, []);
 
+  // Handle room creation for host
   useEffect(() => {
-    if (isHost && roomId) {
-      setConnectionStatus('connecting');
-      socket.emit('create-room', { roomId, displayName: 'Host' });
-      socket.once('room-created', ({ isAdmin: admin, displayName: name }) => {
-        setIsAdmin(admin);
-        setDisplayName(name);
-        setConnectionStatus('connected');
-        joinMeeting('Host', true);
-      });
-      socket.once('error', ({ message }) => {
-        console.error('Room creation error:', message);
-        setConnectionStatus('error');
-      });
+    if (isCreatingRoom && roomId && !initializedRef.current) {
+      initializedRef.current = true;
+      createRoomAndJoin();
     }
-  }, [isHost, roomId]);
+  }, [isCreatingRoom, roomId]);
 
+  // Duration timer
   useEffect(() => {
     const interval = setInterval(() => {
       if (hasJoined) {
-        setMeetingDuration((prev) => prev + 1);
+        setMeetingDuration(prev => prev + 1);
       }
     }, 1000);
     return () => clearInterval(interval);
   }, [hasJoined]);
 
+  // Initialize transform when local stream is ready
   useEffect(() => {
-    if (localStream && !transformInitializedRef.current) {
+    if (localStream && !processedStream) {
       initializeTransform(localStream);
-      transformInitializedRef.current = true;
     }
-  }, [localStream, initializeTransform]);
+  }, [localStream, processedStream, initializeTransform]);
 
-  useEffect(() => {
-    if (referenceVideo && transformationSettings.enabled) {
-      setStatusMessage('Transformation Active');
-    }
-  }, [referenceVideo, transformationSettings.enabled]);
-
-  const setStatusMessage = useCallback((message: string) => {
-    console.log('Status:', message);
-  }, []);
-
-  const formatDuration = (seconds: number) => {
-    const hrs = Math.floor(seconds / 3600);
-    const mins = Math.floor((seconds % 3600) / 60);
-    const secs = seconds % 60;
-    if (hrs > 0) {
-      return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-    }
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  };
-
-  const joinMeeting = useCallback(async (name: string, skipPrompt = false) => {
-    if (!skipPrompt && waitingForName) {
-      const enteredName = displayNameRef.current?.value || name;
-      setDisplayName(enteredName);
-    }
-    setWaitingForName(false);
-
+  const createRoomAndJoin = async () => {
     try {
-      setConnectionStatus('connecting');
+      setError(null);
+
+      // Start camera first
       const stream = await startLocalStream();
 
-      if (!isHost) {
-        socket.emit('join-room', { roomId, displayName: name });
-        socket.once('room-joined', ({ isAdmin: admin, displayName: joinedName }) => {
-          setIsAdmin(admin);
-          setDisplayName(joinedName);
-          setHasJoined(true);
-          setConnectionStatus('connected');
-          if (admin) {
-            setShowInvitePrompt(true);
-            setTimeout(() => setShowInvitePrompt(false), 5000);
-          }
-        });
-        socket.once('error', ({ message }) => {
-          console.error('Join error:', message);
-          setConnectionStatus('error');
-        });
-        initPeerConnections(roomId!);
-      } else {
+      // Create room via socket
+      socket.emit('create-room', { roomId, displayName: 'Host' });
+
+      socket.once('room-created', (data) => {
+        setIsAdmin(true);
+        setDisplayName(data.displayName || 'Host');
         setHasJoined(true);
         setShowInvitePrompt(true);
         setTimeout(() => setShowInvitePrompt(false), 5000);
-        initPeerConnections(roomId!);
-      }
 
-      if (stream && !transformInitializedRef.current) {
-        initializeTransform(stream);
-        transformInitializedRef.current = true;
-      }
-    } catch (error) {
-      console.error('Failed to join meeting:', error);
-      setConnectionStatus('error');
+        initPeerConnections(roomId!);
+
+        if (stream) {
+          initializeTransform(stream);
+        }
+      });
+
+      socket.once('error', (err) => {
+        setError(err.message);
+      });
+    } catch (err) {
+      console.error('Failed to create room:', err);
+      setError('Failed to access camera or create room');
     }
-  }, [isHost, waitingForName, roomId, startLocalStream, initializeTransform, initPeerConnections]);
+  };
+
+  const joinRoomWithDisplayName = async (name: string) => {
+    if (!roomId) {
+      setError('Invalid room ID');
+      return;
+    }
+
+    try {
+      setError(null);
+      setDisplayName(name);
+      setNeedsNameInput(false);
+
+      // Start camera
+      const stream = await startLocalStream();
+
+      // Join room via socket
+      socket.emit('join-room', { roomId, displayName: name });
+
+      socket.once('room-joined', (data) => {
+        setIsAdmin(data.isAdmin);
+        setDisplayName(data.displayName || name);
+        setHasJoined(true);
+
+        initPeerConnections(roomId);
+
+        if (stream) {
+          initializeTransform(stream);
+        }
+      });
+
+      socket.once('error', (err) => {
+        setError(err.message || 'Failed to join room');
+      });
+    } catch (err) {
+      console.error('Failed to join room:', err);
+      setError('Failed to access camera or join room');
+    }
+  };
 
   const leaveMeeting = useCallback(() => {
     cleanup();
@@ -180,10 +188,17 @@ export default function Meeting() {
     setTimeout(() => setCopied(false), 2000);
   }, [roomId]);
 
+  const formatDuration = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
   const allParticipants = Array.from(participants.values());
   const totalParticipants = allParticipants.length + 1;
 
-  if (waitingForName) {
+  // Name input screen (for guests joining via link)
+  if (needsNameInput) {
     return (
       <div className="min-h-screen gradient-dark flex flex-col items-center justify-center px-4">
         <Logo size="lg" />
@@ -191,20 +206,26 @@ export default function Meeting() {
           <h2 className="text-xl font-semibold text-white mb-6 text-center">
             Join Meeting
           </h2>
+          {error && (
+            <div className="mb-4 p-3 bg-red-500/10 border border-red-500/30 rounded-lg flex items-center gap-2 text-red-400 text-sm">
+              <AlertCircle size={16} />
+              {error}
+            </div>
+          )}
           <div className="space-y-4">
             <div>
               <label className="block text-sm font-medium text-dark-300 text-left mb-2">
-                Enter your name to join
+                Enter your name
               </label>
               <input
-                ref={displayNameRef}
+                ref={nameInputRef}
                 type="text"
-                defaultValue={displayName}
-                placeholder="Your display name"
+                placeholder="Your name"
                 className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-lg text-white placeholder-dark-500 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 transition-all"
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
-                    joinMeeting(displayNameRef.current?.value || displayName);
+                    const name = nameInputRef.current?.value?.trim();
+                    if (name) joinRoomWithDisplayName(name);
                   }
                 }}
               />
@@ -217,10 +238,13 @@ export default function Meeting() {
                 Cancel
               </button>
               <button
-                onClick={() => joinMeeting(displayNameRef.current?.value || displayName)}
+                onClick={() => {
+                  const name = nameInputRef.current?.value?.trim();
+                  if (name) joinRoomWithDisplayName(name);
+                }}
                 className="flex-1 px-6 py-3 bg-primary-500 hover:bg-primary-600 text-white rounded-lg font-medium transition-colors"
               >
-                Join Meeting
+                Join
               </button>
             </div>
           </div>
@@ -229,16 +253,20 @@ export default function Meeting() {
     );
   }
 
+  // Connecting screen
   if (!hasJoined) {
     return (
-      <div className="min-h-screen gradient-dark flex items-center justify-center">
+      <div className="min-h-screen gradient-dark flex flex-col items-center justify-center">
         <div className="flex flex-col items-center gap-4">
           <div className="w-12 h-12 border-4 border-primary-500 border-t-transparent rounded-full animate-spin" />
           <p className="text-dark-300">
-            {connectionStatus === 'error' ? 'Connection failed. Please try again.' : 'Connecting to meeting...'}
+            {error || 'Connecting to meeting...'}
           </p>
-          {connectionStatus === 'error' && (
-            <button onClick={() => navigate('/')} className="px-4 py-2 bg-primary-500 hover:bg-primary-600 rounded-lg text-white">
+          {error && (
+            <button
+              onClick={() => navigate('/')}
+              className="px-6 py-2 bg-primary-500 hover:bg-primary-600 text-white rounded-lg"
+            >
               Back to Home
             </button>
           )}
@@ -249,6 +277,7 @@ export default function Meeting() {
 
   return (
     <div className="min-h-screen gradient-dark flex flex-col">
+      {/* Header */}
       <header className="flex-shrink-0 h-16 bg-dark-900/90 backdrop-blur-sm border-b border-dark-700 flex items-center justify-between px-4 md:px-6 z-30">
         <div className="flex items-center gap-4">
           <Logo size="sm" />
@@ -261,20 +290,6 @@ export default function Meeting() {
         </div>
 
         <div className="flex items-center gap-3">
-          <div className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${
-            statusMessage.includes('Active')
-              ? 'bg-primary-500/20 border border-primary-500/30'
-              : 'bg-dark-800 border border-dark-700'
-          }`}>
-            <div className={`w-2 h-2 rounded-full ${
-              statusMessage.includes('Active') || statusMessage.includes('Ready')
-                ? 'bg-green-500'
-                : statusMessage.includes('Loading')
-                ? 'bg-yellow-500'
-                : 'bg-dark-500'
-            }`} />
-            <span className="text-xs text-dark-300">{statusMessage}</span>
-          </div>
           {isAdmin && (
             <button
               onClick={copyInviteLink}
@@ -291,16 +306,17 @@ export default function Meeting() {
         </div>
       </header>
 
+      {/* Invite prompt */}
       {showInvitePrompt && isAdmin && (
         <div className="fixed top-20 right-4 bg-dark-800 border border-dark-600 rounded-xl p-4 shadow-xl z-50 animate-fade-in">
           <p className="text-sm text-dark-300 mb-2">Share this link to invite participants:</p>
           <div className="flex items-center gap-2">
-            <div className="px-3 py-2 bg-dark-900 rounded text-primary-400 text-sm font-mono">
+            <div className="px-3 py-2 bg-dark-900 rounded text-primary-400 text-sm font-mono truncate max-w-xs">
               {`${window.location.origin}/meeting/${roomId}?join=true`}
             </div>
             <button
               onClick={copyInviteLink}
-              className="p-2 bg-primary-500 hover:bg-primary-600 rounded transition-colors"
+              className="p-2 bg-primary-500 hover:bg-primary-600 rounded transition-colors shrink-0"
             >
               {copied ? <Check size={16} className="text-white" /> : <Copy size={16} className="text-white" />}
             </button>
@@ -308,21 +324,16 @@ export default function Meeting() {
         </div>
       )}
 
+      {/* Main content */}
       <div className="flex-1 flex overflow-hidden">
         <main className={`flex-1 flex items-center justify-center p-3 md:p-4 lg:p-6 transition-all duration-300 ${isAdmin && !panelCollapsed ? 'pr-80' : ''}`}>
-          <div
-            className={`grid gap-3 md:gap-4 w-full max-w-7xl ${
-              totalParticipants <= 1
-                ? 'grid-cols-1 max-w-xl'
-                : totalParticipants === 2
-                ? 'grid-cols-1 md:grid-cols-2 max-w-3xl'
-                : totalParticipants <= 4
-                ? 'grid-cols-2 md:grid-cols-2 lg:grid-cols-2'
-                : totalParticipants <= 6
-                ? 'grid-cols-2 md:grid-cols-3'
-                : 'grid-cols-2 md:grid-cols-3 lg:grid-cols-4'
-            }`}
-          >
+          <div className={`grid gap-3 md:gap-4 w-full max-w-7xl ${
+            totalParticipants <= 1 ? 'grid-cols-1 max-w-xl' :
+            totalParticipants === 2 ? 'grid-cols-1 md:grid-cols-2 max-w-3xl' :
+            totalParticipants <= 4 ? 'grid-cols-2' :
+            totalParticipants <= 6 ? 'grid-cols-2 md:grid-cols-3' :
+            'grid-cols-2 md:grid-cols-3 lg:grid-cols-4'
+          }`}>
             <VideoFrame
               stream={actualLocalStream}
               participant={{
@@ -334,7 +345,7 @@ export default function Meeting() {
               }}
               isLocal
             />
-            {allParticipants.map((participant) => (
+            {allParticipants.map(participant => (
               <VideoFrame
                 key={participant.id}
                 stream={participant.stream}
@@ -344,6 +355,7 @@ export default function Meeting() {
           </div>
         </main>
 
+        {/* Transformation panel - ONLY for admin (host) */}
         {isAdmin && (
           <TransformPanel
             transformationSettings={transformationSettings}
@@ -358,34 +370,23 @@ export default function Meeting() {
         )}
       </div>
 
+      {/* Footer controls */}
       <footer className="flex-shrink-0 h-16 md:h-20 bg-dark-900/90 backdrop-blur-sm border-t border-dark-700 flex items-center justify-center gap-3 md:gap-4 px-4 z-30">
         <button
           onClick={toggleMicrophone}
           className={`w-12 h-12 md:w-14 md:h-14 rounded-full flex items-center justify-center transition-all ${
-            microphoneEnabled
-              ? 'bg-dark-700 hover:bg-dark-600'
-              : 'bg-red-600 hover:bg-red-700'
+            microphoneEnabled ? 'bg-dark-700 hover:bg-dark-600' : 'bg-red-600 hover:bg-red-700'
           }`}
         >
-          {microphoneEnabled ? (
-            <Mic size={24} className="text-white" />
-          ) : (
-            <MicOff size={24} className="text-white" />
-          )}
+          {microphoneEnabled ? <Mic size={24} className="text-white" /> : <MicOff size={24} className="text-white" />}
         </button>
         <button
           onClick={toggleCamera}
           className={`w-12 h-12 md:w-14 md:h-14 rounded-full flex items-center justify-center transition-all ${
-            cameraEnabled
-              ? 'bg-dark-700 hover:bg-dark-600'
-              : 'bg-red-600 hover:bg-red-700'
+            cameraEnabled ? 'bg-dark-700 hover:bg-dark-600' : 'bg-red-600 hover:bg-red-700'
           }`}
         >
-          {cameraEnabled ? (
-            <Video size={24} className="text-white" />
-          ) : (
-            <VideoOff size={24} className="text-white" />
-          )}
+          {cameraEnabled ? <Video size={24} className="text-white" /> : <VideoOff size={24} className="text-white" />}
         </button>
         <button
           onClick={leaveMeeting}

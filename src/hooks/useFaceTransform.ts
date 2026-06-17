@@ -43,26 +43,25 @@ export function useFaceTransform(): UseFaceTransformReturn {
   const [referenceVideo, setReferenceVideo] = useState<HTMLVideoElement | null>(null);
 
   const outputCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const inputCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const refFrameCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const bgCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const backgroundImgRef = useRef<HTMLImageElement | null>(null);
   const inputStreamRef = useRef<MediaStream | null>(null);
   const selfieSegmentationRef = useRef<any>(null);
-  const faceMeshRef = useRef<any>(null);
   const isInitializedRef = useRef(false);
   const isProcessingRef = useRef(false);
 
   const currentBackgroundRef = useRef<string>('');
   const settingsRef = useRef(transformationSettings);
-  const referenceFrameIdxRef = useRef<number>(0);
-  const refVideoReadyRef = useRef<boolean>(false);
+  const referenceVideoRef = useRef<HTMLVideoElement | null>(null);
 
   useEffect(() => {
     settingsRef.current = transformationSettings;
   }, [transformationSettings]);
+
+  useEffect(() => {
+    referenceVideoRef.current = referenceVideo;
+  }, [referenceVideo]);
 
   const loadScript = useCallback((id: string, src: string): Promise<void> => {
     return new Promise((resolve, reject) => {
@@ -81,61 +80,8 @@ export function useFaceTransform(): UseFaceTransformReturn {
     });
   }, []);
 
-  const loadMediaPipeScripts = useCallback(async () => {
-    setStatusMessage('Loading AI models...');
-
-    await loadScript('mediapipe-selfie', 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js');
-    await loadScript('mediapipe-face-mesh', 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js');
-
-    isInitializedRef.current = true;
-  }, [loadScript]);
-
-  const initializeFaceMesh = useCallback(async () => {
-    if (faceMeshRef.current) return;
-
-    if (!window.FaceMesh) {
-      throw new Error('FaceMesh not loaded');
-    }
-
-    const faceMesh = new window.FaceMesh({
-      locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/${file}`,
-    });
-
-    faceMesh.setOptions({
-      maxNumFaces: 1,
-      refineLandmarks: true,
-      minDetectionConfidence: 0.5,
-      minTrackingConfidence: 0.5,
-    });
-
-    faceMeshRef.current = faceMesh;
-  }, []);
-
-  const initializeSelfieSegmentation = useCallback(async () => {
-    if (selfieSegmentationRef.current) return selfieSegmentationRef.current;
-
-    if (!window.SelfieSegmentation) {
-      throw new Error('SelfieSegmentation not loaded');
-    }
-
-    const selfieSegmentation = new window.SelfieSegmentation({
-      locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`,
-    });
-
-    selfieSegmentation.setOptions({
-      modelSelection: 1,
-      selfieMode: false,
-    });
-
-    selfieSegmentationRef.current = selfieSegmentation;
-    return selfieSegmentation;
-  }, []);
-
   const initializeTransform = useCallback(async (stream: MediaStream) => {
-    if (isProcessingRef.current) {
-      setStatusMessage('Already initializing...');
-      return;
-    }
+    if (isProcessingRef.current) return;
     isProcessingRef.current = true;
     inputStreamRef.current = stream;
     setIsProcessing(true);
@@ -162,234 +108,233 @@ export function useFaceTransform(): UseFaceTransformReturn {
     outputCanvas.height = 720;
     outputCanvasRef.current = outputCanvas;
 
-    const inputCanvas = document.createElement('canvas');
-    inputCanvas.width = 1280;
-    inputCanvas.height = 720;
-    inputCanvasRef.current = inputCanvas;
-
-    const bgCanvas = document.createElement('canvas');
-    bgCanvas.width = 1280;
-    bgCanvas.height = 720;
-    bgCanvasRef.current = bgCanvas;
-
-    const refFrameCanvas = document.createElement('canvas');
-    refFrameCanvas.width = 640;
-    refFrameCanvas.height = 360;
-    refFrameCanvasRef.current = refFrameCanvas;
-
     const outputStream = outputCanvas.captureStream(30);
     stream.getAudioTracks().forEach(track => outputStream.addTrack(track));
     setProcessedStream(outputStream);
 
     try {
-      await loadMediaPipeScripts();
-      await initializeSelfieSegmentation();
-      setStatusMessage('AI models loaded');
+      setStatusMessage('Loading AI model...');
+      await loadScript('mediapipe-selfie', 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js');
+
+      if (!window.SelfieSegmentation) {
+        throw new Error('SelfieSegmentation not loaded');
+      }
+
+      const selfieSegmentation = new window.SelfieSegmentation({
+        locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`,
+      });
+
+      selfieSegmentation.setOptions({
+        modelSelection: 1,
+        selfieMode: false,
+      });
+
+      selfieSegmentationRef.current = selfieSegmentation;
+      setStatusMessage('AI Ready');
+
+      startProcessingLoop();
     } catch (error) {
       console.error('Error loading MediaPipe:', error);
-      setStatusMessage('AI model load failed');
-      isProcessingRef.current = false;
-      return;
+      setStatusMessage('AI model failed to load');
+
+      const fallbackLoop = () => {
+        if (!outputCanvasRef.current || !videoRef.current) {
+          animationFrameRef.current = requestAnimationFrame(fallbackLoop);
+          return;
+        }
+        const ctx = outputCanvasRef.current.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(videoRef.current, 0, 0, outputCanvasRef.current.width, outputCanvasRef.current.height);
+        }
+        animationFrameRef.current = requestAnimationFrame(fallbackLoop);
+      };
+      fallbackLoop();
     }
 
-    startProcessingLoop();
     isProcessingRef.current = false;
-  }, [loadMediaPipeScripts, initializeSelfieSegmentation]);
+  }, [loadScript]);
 
   const startProcessingLoop = useCallback(() => {
-    const selfieSegmentation = selfieSegmentationRef.current;
-    const video = videoRef.current;
-    const outputCanvas = outputCanvasRef.current;
-    const inputCanvas = inputCanvasRef.current;
-    const refFrameCanvas = refFrameCanvasRef.current;
+    const processFrame = async () => {
+      const video = videoRef.current;
+      const outputCanvas = outputCanvasRef.current;
+      const selfieSegmentation = selfieSegmentationRef.current;
 
-    if (!selfieSegmentation || !video || !outputCanvas || !inputCanvas) {
-      animationFrameRef.current = requestAnimationFrame(startProcessingLoop);
-      return;
-    }
-
-    const outputCtx = outputCanvas.getContext('2d', { willReadFrequently: true });
-    const inputCtx = inputCanvas.getContext('2d', { willReadFrequently: true });
-
-    if (!outputCtx || !inputCtx) {
-      animationFrameRef.current = requestAnimationFrame(startProcessingLoop);
-      return;
-    }
-
-    let lastProcessTime = 0;
-    const targetFPS = 30;
-    const frameInterval = 1000 / targetFPS;
-
-    const processFrame = async (timestamp: number) => {
-      if (!videoRef.current || !outputCanvasRef.current || !inputCanvasRef.current) {
+      if (!video || !outputCanvas || video.readyState < 2) {
         animationFrameRef.current = requestAnimationFrame(processFrame);
         return;
       }
 
-      const elapsed = timestamp - lastProcessTime;
+      const ctx = outputCanvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) {
+        animationFrameRef.current = requestAnimationFrame(processFrame);
+        return;
+      }
 
-      if (elapsed >= frameInterval && videoRef.current.readyState >= 2) {
-        lastProcessTime = timestamp - (elapsed % frameInterval);
-
-        const inCtx = inputCanvasRef.current.getContext('2d');
-        if (inCtx) {
-          inCtx.drawImage(videoRef.current, 0, 0, inputCanvasRef.current.width, inputCanvasRef.current.height);
-        }
-
-        const settings = settingsRef.current;
-        const refVideo = referenceVideo;
-        const bgValue = currentBackgroundRef.current;
-
+      if (selfieSegmentation) {
         try {
-          await selfieSegmentationRef.current.send({ image: videoRef.current });
+          await selfieSegmentation.send({ image: video });
         } catch (e) {
-          const outCtx = outputCanvasRef.current.getContext('2d');
-          if (outCtx && videoRef.current) {
-            outCtx.drawImage(videoRef.current, 0, 0, outputCanvasRef.current.width, outputCanvasRef.current.height);
-          }
+          ctx.drawImage(video, 0, 0, outputCanvas.width, outputCanvas.height);
         }
+      } else {
+        ctx.drawImage(video, 0, 0, outputCanvas.width, outputCanvas.height);
       }
 
       animationFrameRef.current = requestAnimationFrame(processFrame);
     };
 
-    selfieSegmentation.onResults((results: any) => {
-      const outputCanvas = outputCanvasRef.current;
-      const inputCanvas = inputCanvasRef.current;
-      const bgCanvas = bgCanvasRef.current;
-      const video = videoRef.current;
+    if (selfieSegmentationRef.current) {
+      selfieSegmentationRef.current.onResults((results: any) => {
+        const outputCanvas = outputCanvasRef.current;
+        if (!outputCanvas) return;
 
-      if (!outputCanvas || !inputCanvas || !video) return;
+        const ctx = outputCanvas.getContext('2d', { willReadFrequently: true });
+        if (!ctx) return;
 
-      const outCtx = outputCanvas.getContext('2d', { willReadFrequently: true });
-      const bgCtx = bgCanvas?.getContext('2d');
+        const width = outputCanvas.width;
+        const height = outputCanvas.height;
 
-      if (!outCtx) return;
+        const bgValue = currentBackgroundRef.current;
+        const settings = settingsRef.current;
+        const refVid = referenceVideoRef.current;
 
-      outCtx.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
+        ctx.clearRect(0, 0, width, height);
 
-      const settings = settingsRef.current;
-      const refVideo = referenceVideo;
-      const bgValue = currentBackgroundRef.current;
-
-      const shouldTransform = settings.enabled && refVideo && refVideo.readyState >= 2;
-
-      if (shouldTransform && refFrameCanvasRef.current) {
-        const refCtx = refFrameCanvasRef.current.getContext('2d', { willReadFrequently: true });
-        if (refCtx && refVideo) {
-          refCtx.drawImage(refVideo, 0, 0, refFrameCanvasRef.current.width, refFrameCanvasRef.current.height);
+        // Step 1: Draw background if selected
+        if (bgValue && backgroundImgRef.current && backgroundImgRef.current.complete) {
+          ctx.drawImage(backgroundImgRef.current, 0, 0, width, height);
+        } else {
+          ctx.fillStyle = '#1a1a2e';
+          ctx.fillRect(0, 0, width, height);
         }
-      }
 
-      if (bgValue && backgroundImgRef.current && backgroundImgRef.current.complete) {
-        outCtx.drawImage(results.image, 0, 0, outputCanvas.width, outputCanvas.height);
-
+        // Step 2: Draw person on top with proper segmentation
         if (results.segmentationMask) {
-          outCtx.globalCompositeOperation = 'destination-out';
-          outCtx.drawImage(results.segmentationMask, 0, 0, outputCanvas.width, outputCanvas.height);
-          outCtx.globalCompositeOperation = 'destination-over';
-          outCtx.drawImage(backgroundImgRef.current, 0, 0, outputCanvas.width, outputCanvas.height);
-          outCtx.globalCompositeOperation = 'source-over';
-        }
+          // Create temporary canvas for person
+          const personCanvas = document.createElement('canvas');
+          personCanvas.width = width;
+          personCanvas.height = height;
+          const personCtx = personCanvas.getContext('2d');
 
-        if (shouldTransform && refFrameCanvasRef.current) {
-          applyFaceTransformation(outCtx, outputCanvas, refFrameCanvasRef.current, results);
-        }
-      } else {
-        outCtx.drawImage(results.image, 0, 0, outputCanvas.width, outputCanvas.height);
-      }
+          if (personCtx) {
+            // Draw the person
+            personCtx.drawImage(results.image, 0, 0, width, height);
 
-      if (currentBackgroundRef.current === '' && !settings.enabled) {
-        setStatusMessage('Camera Ready');
-      } else if (currentBackgroundRef.current && backgroundImgRef.current?.complete) {
-        setStatusMessage('Background Active');
-      }
+            // Use segmentation mask to extract person
+            personCtx.globalCompositeOperation = 'destination-in';
+            personCtx.drawImage(results.segmentationMask, 0, 0, width, height);
+            personCtx.globalCompositeOperation = 'source-over';
 
-      if (shouldTransform) {
-        setStatusMessage('Transformation Active');
-      }
-    });
-
-    animationFrameRef.current = requestAnimationFrame(processFrame);
-  }, [referenceVideo]);
-
-  const applyFaceTransformation = (
-    outputCtx: CanvasRenderingContext2D,
-    outputCanvas: HTMLCanvasElement,
-    refFrameCanvas: HTMLCanvasElement,
-    results: any
-  ) => {
-    const refCtx = refFrameCanvas.getContext('2d', { willReadFrequently: true } as any);
-    if (!refCtx) return;
-
-    const width = outputCanvas.width;
-    const height = outputCanvas.height;
-
-    const outputData = outputCtx.getImageData(0, 0, width, height);
-    const outputPixels = outputData.data;
-
-    const refData = refCtx.getImageData(0, 0, refFrameCanvas.width, refFrameCanvas.height);
-    const refPixels = refData.data;
-
-    const scaleX = refFrameCanvas.width / width;
-    const scaleY = refFrameCanvas.height / height;
-
-    const sampleStep = 4;
-    const faceRegionCenterX = width * 0.5;
-    const faceRegionCenterY = height * 0.4;
-    const faceRegionWidth = width * 0.35;
-    const faceRegionHeight = height * 0.4;
-
-    for (let y = 0; y < height; y += sampleStep) {
-      for (let x = 0; x < width; x += sampleStep) {
-        const dx = x - faceRegionCenterX;
-        const dy = y - faceRegionCenterY;
-
-        const normalizedDistX = dx / (faceRegionWidth / 2);
-        const normalizedDistY = dy / (faceRegionHeight / 2);
-        const distance = Math.sqrt(normalizedDistX * normalizedDistX + normalizedDistY * normalizedDistY);
-
-        if (distance < 1.3) {
-          const blendFactor = Math.pow(Math.max(0, 1 - distance / 1.3), 1.2);
-
-          const refX = Math.floor(x * scaleX);
-          const refY = Math.floor(y * scaleY);
-
-          if (refX >= 0 && refX < refFrameCanvas.width && refY >= 0 && refY < refFrameCanvas.height) {
-            const srcIdx = (y * width + x) * 4;
-            const refIdx = (refY * refFrameCanvas.width + refX) * 4;
-
-            const srcR = outputPixels[srcIdx] || 0;
-            const srcG = outputPixels[srcIdx + 1] || 0;
-            const srcB = outputPixels[srcIdx + 2] || 0;
-
-            const refR = refPixels[refIdx] || 0;
-            const refG = refPixels[refIdx + 1] || 0;
-            const refB = refPixels[refIdx + 2] || 0;
-
-            const brightnessSrc = (srcR + srcG + srcB) / 3;
-            const brightnessRef = (refR + refG + refB) / 3;
-            const brightnessRatio = brightnessSrc > 0 ? brightnessRef / brightnessSrc : 1;
-
-            let adjustedR = refR;
-            let adjustedG = refG;
-            let adjustedB = refB;
-
-            if (brightnessRatio > 0.3 && brightnessRatio < 3) {
-              adjustedR = Math.min(255, Math.max(0, refR * (0.85 + 0.15 * brightnessRatio)));
-              adjustedG = Math.min(255, Math.max(0, refG * (0.85 + 0.15 * brightnessRatio)));
-              adjustedB = Math.min(255, Math.max(0, refB * (0.85 + 0.15 * brightnessRatio)));
+            // Apply face transformation if enabled
+            if (settings.enabled && refVid && refVid.readyState >= 2) {
+              applyFaceTransformation(personCtx, personCanvas, refVid, width, height);
             }
 
-            outputPixels[srcIdx] = Math.round(srcR * (1 - blendFactor) + adjustedR * blendFactor);
-            outputPixels[srcIdx + 1] = Math.round(srcG * (1 - blendFactor) + adjustedG * blendFactor);
-            outputPixels[srcIdx + 2] = Math.round(srcB * (1 - blendFactor) + adjustedB * blendFactor);
+            // Draw person on top of background
+            ctx.drawImage(personCanvas, 0, 0);
+          }
+        } else {
+          // Fallback: just draw the video
+          ctx.drawImage(results.image, 0, 0, width, height);
+        }
+
+        // Update status
+        if (settings.enabled && refVid && refVid.readyState >= 2) {
+          setStatusMessage('Transformation Active');
+        } else if (bgValue && backgroundImgRef.current?.complete) {
+          setStatusMessage('Background Active');
+        } else {
+          setStatusMessage('Camera Ready');
+        }
+      });
+    }
+
+    animationFrameRef.current = requestAnimationFrame(processFrame);
+  }, []);
+
+  const applyFaceTransformation = (
+    ctx: CanvasRenderingContext2D,
+    canvas: HTMLCanvasElement,
+    refVid: HTMLVideoElement,
+    width: number,
+    height: number
+  ) => {
+    // Get reference frame from video
+    const refCanvas = document.createElement('canvas');
+    refCanvas.width = width;
+    refCanvas.height = height;
+    const refCtx = refCanvas.getContext('2d');
+
+    if (!refCtx) return;
+
+    refCtx.drawImage(refVid, 0, 0, width, height);
+
+    const outputData = ctx.getImageData(0, 0, width, height);
+    const refData = refCtx.getImageData(0, 0, width, height);
+
+    const outputPixels = outputData.data;
+    const refPixels = refData.data;
+
+    // Face region estimation (center-top area where face typically is)
+    const faceCenterX = width * 0.5;
+    const faceCenterY = height * 0.35;
+    const faceWidth = width * 0.4;
+    const faceHeight = height * 0.5;
+
+    // Sample every 2 pixels for performance
+    for (let y = 0; y < height; y += 2) {
+      for (let x = 0; x < width; x += 2) {
+        const dx = (x - faceCenterX) / (faceWidth / 2);
+        const dy = (y - faceCenterY) / (faceHeight / 2);
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist < 1.0) {
+          const blend = Math.pow(1 - dist, 1.5); // Smooth falloff
+          const idx = (y * width + x) * 4;
+
+          // Get colors
+          const srcR = outputPixels[idx];
+          const srcG = outputPixels[idx + 1];
+          const srcB = outputPixels[idx + 2];
+
+          const refR = refPixels[idx];
+          const refG = refPixels[idx + 1];
+          const refB = refPixels[idx + 2];
+
+          // Brightness matching
+          const srcBrightness = (srcR + srcG + srcB) / 3;
+          const refBrightness = (refR + refG + refB) / 3;
+          const brightnessRatio = srcBrightness > 0 ? refBrightness / srcBrightness : 1;
+          const clampedRatio = Math.max(0.5, Math.min(2.0, brightnessRatio));
+
+          const adjR = Math.min(255, Math.max(0, refR / clampedRatio));
+          const adjG = Math.min(255, Math.max(0, refG / clampedRatio));
+          const adjB = Math.min(255, Math.max(0, refB / clampedRatio));
+
+          // Blend colors
+          outputPixels[idx] = Math.round(srcR * (1 - blend) + adjR * blend);
+          outputPixels[idx + 1] = Math.round(srcG * (1 - blend) + adjG * blend);
+          outputPixels[idx + 2] = Math.round(srcB * (1 - blend) + adjB * blend);
+
+          // Fill adjacent pixels for smooth result
+          if (x + 1 < width) {
+            const idx2 = idx + 4;
+            outputPixels[idx2] = outputPixels[idx];
+            outputPixels[idx2 + 1] = outputPixels[idx + 1];
+            outputPixels[idx2 + 2] = outputPixels[idx + 2];
+          }
+          if (y + 1 < height) {
+            const idx3 = idx + width * 4;
+            outputPixels[idx3] = outputPixels[idx];
+            outputPixels[idx3 + 1] = outputPixels[idx + 1];
+            outputPixels[idx3 + 2] = outputPixels[idx + 2];
           }
         }
       }
     }
 
-    outputCtx.putImageData(outputData, 0, 0);
+    ctx.putImageData(outputData, 0, 0);
   };
 
   const updateBackground = useCallback((backgroundId: string) => {
@@ -437,13 +382,6 @@ export function useFaceTransform(): UseFaceTransformReturn {
       selfieSegmentationRef.current = null;
     }
 
-    if (faceMeshRef.current) {
-      try {
-        faceMeshRef.current.close();
-      } catch (e) {}
-      faceMeshRef.current = null;
-    }
-
     if (videoRef.current) {
       videoRef.current.pause();
       videoRef.current.srcObject = null;
@@ -458,11 +396,10 @@ export function useFaceTransform(): UseFaceTransformReturn {
     inputStreamRef.current = null;
     backgroundImgRef.current = null;
     outputCanvasRef.current = null;
-    inputCanvasRef.current = null;
-    bgCanvasRef.current = null;
-    refFrameCanvasRef.current = null;
-
     currentBackgroundRef.current = '';
+    referenceVideoRef.current = null;
+    isInitializedRef.current = false;
+
     setProcessedStream(null);
     setIsProcessing(false);
     setStatusMessage('Camera Ready');
