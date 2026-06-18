@@ -15,18 +15,48 @@ interface UseFaceTransformReturn {
   cleanup: () => void;
 }
 
+// People-free professional backgrounds
 export const backgroundOptions: BackgroundOption[] = [
-  { id: 'none', name: 'None', thumbnail: '', value: '' },
-  { id: 'office', name: 'Modern Office', thumbnail: 'https://images.pexels.com/photos/1170412/pexels-photo-1170412.jpeg?auto=compress&cs=tinysrgb&w=200', value: 'https://images.pexels.com/photos/1170412/pexels-photo-1170412.jpeg?auto=compress&cs=tinysrgb&w=1280' },
-  { id: 'luxury', name: 'Luxury Office', thumbnail: 'https://images.pexels.com/photos/3801740/pexels-photo-3801740.jpeg?auto=compress&cs=tinysrgb&w=200', value: 'https://images.pexels.com/photos/3801740/pexels-photo-3801740.jpeg?auto=compress&cs=tinysrgb&w=1280' },
-  { id: 'studio', name: 'Studio', thumbnail: 'https://images.pexels.com/photos/1595385/pexels-photo-1595385.jpeg?auto=compress&cs=tinysrgb&w=200', value: 'https://images.pexels.com/photos/1595385/pexels-photo-1595385.jpeg?auto=compress&cs=tinysrgb&w=1280' },
-  { id: 'conference', name: 'Conference Room', thumbnail: 'https://images.pexels.com/photos/159711/books-coffee-students-room-159711.jpeg?auto=compress&cs=tinysrgb&w=200', value: 'https://images.pexels.com/photos/159711/books-coffee-students-room-159711.jpeg?auto=compress&cs=tinysrgb&w=1280' },
-  { id: 'apartment', name: 'Modern Apartment', thumbnail: 'https://images.pexels.com/photos/1571460/pexels-photo-1571460.jpeg?auto=compress&cs=tinysrgb&w=200', value: 'https://images.pexels.com/photos/1571460/pexels-photo-1571460.jpeg?auto=compress&cs=tinysrgb&w=1280' },
+  { id: 'none',       name: 'None',             thumbnail: '', value: '' },
+  // Clean empty office interior – no people
+  {
+    id: 'office',
+    name: 'Modern Office',
+    thumbnail: 'https://images.pexels.com/photos/667838/pexels-photo-667838.jpeg?auto=compress&cs=tinysrgb&w=200',
+    value:     'https://images.pexels.com/photos/667838/pexels-photo-667838.jpeg?auto=compress&cs=tinysrgb&w=1280',
+  },
+  // High-end executive office / glass partition – empty
+  {
+    id: 'luxury',
+    name: 'Luxury Office',
+    thumbnail: 'https://images.pexels.com/photos/1743555/pexels-photo-1743555.jpeg?auto=compress&cs=tinysrgb&w=200',
+    value:     'https://images.pexels.com/photos/1743555/pexels-photo-1743555.jpeg?auto=compress&cs=tinysrgb&w=1280',
+  },
+  // Clean minimalist white studio / content creator backdrop – no people
+  {
+    id: 'studio',
+    name: 'Studio',
+    thumbnail: 'https://images.pexels.com/photos/1571463/pexels-photo-1571463.jpeg?auto=compress&cs=tinysrgb&w=200',
+    value:     'https://images.pexels.com/photos/1571463/pexels-photo-1571463.jpeg?auto=compress&cs=tinysrgb&w=1280',
+  },
+  // Empty board-room style conference room – chairs + long table, no people
+  {
+    id: 'conference',
+    name: 'Conference Room',
+    thumbnail: 'https://images.pexels.com/photos/416320/pexels-photo-416320.jpeg?auto=compress&cs=tinysrgb&w=200',
+    value:     'https://images.pexels.com/photos/416320/pexels-photo-416320.jpeg?auto=compress&cs=tinysrgb&w=1280',
+  },
+  // Modern living-room apartment – warm, inviting, no people
+  {
+    id: 'apartment',
+    name: 'Modern Apartment',
+    thumbnail: 'https://images.pexels.com/photos/1571460/pexels-photo-1571460.jpeg?auto=compress&cs=tinysrgb&w=200',
+    value:     'https://images.pexels.com/photos/1571460/pexels-photo-1571460.jpeg?auto=compress&cs=tinysrgb&w=1280',
+  },
 ];
 
 declare global {
   interface Window {
-    FaceMesh: any;
     SelfieSegmentation: any;
   }
 }
@@ -42,375 +72,248 @@ export function useFaceTransform(): UseFaceTransformReturn {
   });
   const [referenceVideo, setReferenceVideo] = useState<HTMLVideoElement | null>(null);
 
-  const outputCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
-  const backgroundImgRef = useRef<HTMLImageElement | null>(null);
-  const inputStreamRef = useRef<MediaStream | null>(null);
-  const selfieSegmentationRef = useRef<any>(null);
-  const isInitializedRef = useRef(false);
-  const isProcessingRef = useRef(false);
+  const outputCanvasRef    = useRef<HTMLCanvasElement | null>(null);
+  const videoRef           = useRef<HTMLVideoElement | null>(null);
+  const animationFrameRef  = useRef<number | null>(null);
+  const backgroundImgRef   = useRef<HTMLImageElement | null>(null);
+  const selfieSegRef       = useRef<any>(null);
+  const isProcessingRef    = useRef(false);
+  const scriptLoadedRef    = useRef(false);
 
-  const currentBackgroundRef = useRef<string>('');
-  const settingsRef = useRef(transformationSettings);
-  const referenceVideoRef = useRef<HTMLVideoElement | null>(null);
+  // Keep refs in sync so the render callback always reads the latest values
+  const currentBgRef   = useRef<string>('');
+  const settingsRef    = useRef(transformationSettings);
+  const refVideoRef    = useRef<HTMLVideoElement | null>(null);
 
-  useEffect(() => {
-    settingsRef.current = transformationSettings;
-  }, [transformationSettings]);
+  useEffect(() => { settingsRef.current = transformationSettings; }, [transformationSettings]);
+  useEffect(() => { refVideoRef.current = referenceVideo; },         [referenceVideo]);
 
-  useEffect(() => {
-    referenceVideoRef.current = referenceVideo;
-  }, [referenceVideo]);
+  // ─── Script loader ──────────────────────────────────────────────────────────
+  const loadScript = useCallback((id: string, src: string): Promise<void> =>
+    new Promise((resolve, reject) => {
+      if (document.getElementById(id)) { resolve(); return; }
+      const s = document.createElement('script');
+      s.id  = id; s.src = src; s.crossOrigin = 'anonymous';
+      s.onload  = () => resolve();
+      s.onerror = () => reject(new Error(`Failed: ${src}`));
+      document.head.appendChild(s);
+    }), []);
 
-  const loadScript = useCallback((id: string, src: string): Promise<void> => {
-    return new Promise((resolve, reject) => {
-      const existing = document.getElementById(id);
-      if (existing) {
-        resolve();
-        return;
-      }
-      const script = document.createElement('script');
-      script.id = id;
-      script.src = src;
-      script.crossOrigin = 'anonymous';
-      script.onload = () => resolve();
-      script.onerror = () => reject(new Error(`Failed to load ${src}`));
-      document.head.appendChild(script);
-    });
-  }, []);
-
+  // ─── Main init ──────────────────────────────────────────────────────────────
   const initializeTransform = useCallback(async (stream: MediaStream) => {
     if (isProcessingRef.current) return;
     isProcessingRef.current = true;
-    inputStreamRef.current = stream;
     setIsProcessing(true);
     setStatusMessage('Starting camera...');
 
-    const video = document.createElement('video');
-    video.srcObject = stream;
-    video.playsInline = true;
-    video.muted = true;
+    /* Source video */
+    const srcVid = document.createElement('video');
+    srcVid.srcObject = stream;
+    srcVid.playsInline = true;
+    srcVid.muted = true;
+    try { await srcVid.play(); } catch { setStatusMessage('Camera Error'); isProcessingRef.current = false; return; }
+    videoRef.current = srcVid;
 
-    try {
-      await video.play();
-      videoRef.current = video;
-      setStatusMessage('Camera Ready');
-    } catch (err) {
-      console.error('Video play error:', err);
-      setStatusMessage('Camera Error');
-      isProcessingRef.current = false;
-      return;
-    }
+    /* Output canvas → stream */
+    const outCanvas = document.createElement('canvas');
+    outCanvas.width  = 1280;
+    outCanvas.height = 720;
+    outputCanvasRef.current = outCanvas;
 
-    const outputCanvas = document.createElement('canvas');
-    outputCanvas.width = 1280;
-    outputCanvas.height = 720;
-    outputCanvasRef.current = outputCanvas;
+    const outStream = outCanvas.captureStream(30);
+    stream.getAudioTracks().forEach(t => outStream.addTrack(t));
+    setProcessedStream(outStream);
 
-    const outputStream = outputCanvas.captureStream(30);
-    stream.getAudioTracks().forEach(track => outputStream.addTrack(track));
-    setProcessedStream(outputStream);
-
+    /* Load MediaPipe */
     try {
       setStatusMessage('Loading AI model...');
-      await loadScript('mediapipe-selfie', 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js');
-
-      if (!window.SelfieSegmentation) {
-        throw new Error('SelfieSegmentation not loaded');
+      if (!scriptLoadedRef.current) {
+        await loadScript('mp-selfie', 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js');
+        scriptLoadedRef.current = true;
       }
 
-      const selfieSegmentation = new window.SelfieSegmentation({
-        locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`,
+      if (!window.SelfieSegmentation) throw new Error('SelfieSegmentation not available');
+
+      const seg = new window.SelfieSegmentation({
+        locateFile: (f: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${f}`,
       });
+      seg.setOptions({ modelSelection: 1, selfieMode: false });
+      selfieSegRef.current = seg;
 
-      selfieSegmentation.setOptions({
-        modelSelection: 1,
-        selfieMode: false,
-      });
-
-      selfieSegmentationRef.current = selfieSegmentation;
-      setStatusMessage('AI Ready');
-
-      startProcessingLoop();
-    } catch (error) {
-      console.error('Error loading MediaPipe:', error);
-      setStatusMessage('AI model failed to load');
-
-      const fallbackLoop = () => {
-        if (!outputCanvasRef.current || !videoRef.current) {
-          animationFrameRef.current = requestAnimationFrame(fallbackLoop);
-          return;
-        }
-        const ctx = outputCanvasRef.current.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(videoRef.current, 0, 0, outputCanvasRef.current.width, outputCanvasRef.current.height);
-        }
-        animationFrameRef.current = requestAnimationFrame(fallbackLoop);
-      };
-      fallbackLoop();
-    }
-
-    isProcessingRef.current = false;
-  }, [loadScript]);
-
-  const startProcessingLoop = useCallback(() => {
-    const processFrame = async () => {
-      const video = videoRef.current;
-      const outputCanvas = outputCanvasRef.current;
-      const selfieSegmentation = selfieSegmentationRef.current;
-
-      if (!video || !outputCanvas || video.readyState < 2) {
-        animationFrameRef.current = requestAnimationFrame(processFrame);
-        return;
-      }
-
-      const ctx = outputCanvas.getContext('2d', { willReadFrequently: true });
-      if (!ctx) {
-        animationFrameRef.current = requestAnimationFrame(processFrame);
-        return;
-      }
-
-      if (selfieSegmentation) {
-        try {
-          await selfieSegmentation.send({ image: video });
-        } catch (e) {
-          ctx.drawImage(video, 0, 0, outputCanvas.width, outputCanvas.height);
-        }
-      } else {
-        ctx.drawImage(video, 0, 0, outputCanvas.width, outputCanvas.height);
-      }
-
-      animationFrameRef.current = requestAnimationFrame(processFrame);
-    };
-
-    if (selfieSegmentationRef.current) {
-      selfieSegmentationRef.current.onResults((results: any) => {
-        const outputCanvas = outputCanvasRef.current;
-        if (!outputCanvas) return;
-
-        const ctx = outputCanvas.getContext('2d', { willReadFrequently: true });
+      /* ── Results callback ── */
+      seg.onResults((results: any) => {
+        const canvas = outputCanvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
         if (!ctx) return;
 
-        const width = outputCanvas.width;
-        const height = outputCanvas.height;
+        const W = canvas.width;
+        const H = canvas.height;
+        const settings  = settingsRef.current;
+        const refVid    = refVideoRef.current;
+        const bgValue   = currentBgRef.current;
+        const bgImg     = backgroundImgRef.current;
 
-        const bgValue = currentBackgroundRef.current;
-        const settings = settingsRef.current;
-        const refVid = referenceVideoRef.current;
+        ctx.clearRect(0, 0, W, H);
 
-        ctx.clearRect(0, 0, width, height);
-
-        // Step 1: Draw background if selected
-        if (bgValue && backgroundImgRef.current && backgroundImgRef.current.complete) {
-          ctx.drawImage(backgroundImgRef.current, 0, 0, width, height);
+        /* 1 ▸ Draw background layer */
+        if (bgValue && bgImg && bgImg.complete && bgImg.naturalWidth > 0) {
+          ctx.drawImage(bgImg, 0, 0, W, H);
         } else {
-          ctx.fillStyle = '#1a1a2e';
-          ctx.fillRect(0, 0, width, height);
+          ctx.fillStyle = '#0f172a';
+          ctx.fillRect(0, 0, W, H);
         }
 
-        // Step 2: Draw person on top with proper segmentation
+        /* 2 ▸ Extract the person using the segmentation mask */
         if (results.segmentationMask) {
-          // Create temporary canvas for person
-          const personCanvas = document.createElement('canvas');
-          personCanvas.width = width;
-          personCanvas.height = height;
-          const personCtx = personCanvas.getContext('2d');
+          /* Off-screen canvas that holds just the person (foreground) */
+          const personCanvas = new OffscreenCanvas(W, H);
+          const pCtx = personCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
+          if (pCtx) {
+            /* Draw the raw camera frame */
+            pCtx.drawImage(results.image, 0, 0, W, H);
 
-          if (personCtx) {
-            // Draw the person
-            personCtx.drawImage(results.image, 0, 0, width, height);
-
-            // Use segmentation mask to extract person
-            personCtx.globalCompositeOperation = 'destination-in';
-            personCtx.drawImage(results.segmentationMask, 0, 0, width, height);
-            personCtx.globalCompositeOperation = 'source-over';
-
-            // Apply face transformation if enabled
+            /* If face-transformation is on, blend the reference face */
             if (settings.enabled && refVid && refVid.readyState >= 2) {
-              applyFaceTransformation(personCtx, personCanvas, refVid, width, height);
+              applyFaceBlend(pCtx, refVid, W, H);
             }
 
-            // Draw person on top of background
+            /* Knock out the background using the inverted mask */
+            pCtx.globalCompositeOperation = 'destination-in';
+            pCtx.drawImage(results.segmentationMask, 0, 0, W, H);
+            pCtx.globalCompositeOperation = 'source-over';
+
+            /* Paint person on top of background */
             ctx.drawImage(personCanvas, 0, 0);
           }
         } else {
-          // Fallback: just draw the video
-          ctx.drawImage(results.image, 0, 0, width, height);
+          /* Fallback: no mask, just draw camera */
+          ctx.drawImage(results.image, 0, 0, W, H);
         }
 
-        // Update status
+        /* 3 ▸ Status text */
         if (settings.enabled && refVid && refVid.readyState >= 2) {
           setStatusMessage('Transformation Active');
-        } else if (bgValue && backgroundImgRef.current?.complete) {
+        } else if (bgValue && bgImg?.complete) {
           setStatusMessage('Background Active');
         } else {
           setStatusMessage('Camera Ready');
         }
       });
-    }
 
-    animationFrameRef.current = requestAnimationFrame(processFrame);
-  }, []);
-
-  const applyFaceTransformation = (
-    ctx: CanvasRenderingContext2D,
-    canvas: HTMLCanvasElement,
-    refVid: HTMLVideoElement,
-    width: number,
-    height: number
-  ) => {
-    // Get reference frame from video
-    const refCanvas = document.createElement('canvas');
-    refCanvas.width = width;
-    refCanvas.height = height;
-    const refCtx = refCanvas.getContext('2d');
-
-    if (!refCtx) return;
-
-    refCtx.drawImage(refVid, 0, 0, width, height);
-
-    const outputData = ctx.getImageData(0, 0, width, height);
-    const refData = refCtx.getImageData(0, 0, width, height);
-
-    const outputPixels = outputData.data;
-    const refPixels = refData.data;
-
-    // Face region estimation (center-top area where face typically is)
-    const faceCenterX = width * 0.5;
-    const faceCenterY = height * 0.35;
-    const faceWidth = width * 0.4;
-    const faceHeight = height * 0.5;
-
-    // Sample every 2 pixels for performance
-    for (let y = 0; y < height; y += 2) {
-      for (let x = 0; x < width; x += 2) {
-        const dx = (x - faceCenterX) / (faceWidth / 2);
-        const dy = (y - faceCenterY) / (faceHeight / 2);
-        const dist = Math.sqrt(dx * dx + dy * dy);
-
-        if (dist < 1.0) {
-          const blend = Math.pow(1 - dist, 1.5); // Smooth falloff
-          const idx = (y * width + x) * 4;
-
-          // Get colors
-          const srcR = outputPixels[idx];
-          const srcG = outputPixels[idx + 1];
-          const srcB = outputPixels[idx + 2];
-
-          const refR = refPixels[idx];
-          const refG = refPixels[idx + 1];
-          const refB = refPixels[idx + 2];
-
-          // Brightness matching
-          const srcBrightness = (srcR + srcG + srcB) / 3;
-          const refBrightness = (refR + refG + refB) / 3;
-          const brightnessRatio = srcBrightness > 0 ? refBrightness / srcBrightness : 1;
-          const clampedRatio = Math.max(0.5, Math.min(2.0, brightnessRatio));
-
-          const adjR = Math.min(255, Math.max(0, refR / clampedRatio));
-          const adjG = Math.min(255, Math.max(0, refG / clampedRatio));
-          const adjB = Math.min(255, Math.max(0, refB / clampedRatio));
-
-          // Blend colors
-          outputPixels[idx] = Math.round(srcR * (1 - blend) + adjR * blend);
-          outputPixels[idx + 1] = Math.round(srcG * (1 - blend) + adjG * blend);
-          outputPixels[idx + 2] = Math.round(srcB * (1 - blend) + adjB * blend);
-
-          // Fill adjacent pixels for smooth result
-          if (x + 1 < width) {
-            const idx2 = idx + 4;
-            outputPixels[idx2] = outputPixels[idx];
-            outputPixels[idx2 + 1] = outputPixels[idx + 1];
-            outputPixels[idx2 + 2] = outputPixels[idx + 2];
-          }
-          if (y + 1 < height) {
-            const idx3 = idx + width * 4;
-            outputPixels[idx3] = outputPixels[idx];
-            outputPixels[idx3 + 1] = outputPixels[idx + 1];
-            outputPixels[idx3 + 2] = outputPixels[idx + 2];
-          }
+      /* ── Processing loop ── */
+      setStatusMessage('Camera Ready');
+      const loop = async () => {
+        const vid = videoRef.current;
+        if (vid && vid.readyState >= 2 && selfieSegRef.current) {
+          try { await selfieSegRef.current.send({ image: vid }); } catch { /* skip frame */ }
         }
-      }
+        animationFrameRef.current = requestAnimationFrame(loop);
+      };
+      animationFrameRef.current = requestAnimationFrame(loop);
+
+    } catch (err) {
+      console.error('MediaPipe failed, using fallback:', err);
+      setStatusMessage('AI model unavailable – background disabled');
+      /* Plain passthrough loop */
+      const fallback = () => {
+        const vid    = videoRef.current;
+        const canvas = outputCanvasRef.current;
+        if (vid && canvas && vid.readyState >= 2) {
+          const ctx = canvas.getContext('2d');
+          ctx?.drawImage(vid, 0, 0, canvas.width, canvas.height);
+        }
+        animationFrameRef.current = requestAnimationFrame(fallback);
+      };
+      fallback();
     }
 
-    ctx.putImageData(outputData, 0, 0);
+    isProcessingRef.current = false;
+  }, [loadScript]);
+
+  // ─── Face blend helper ───────────────────────────────────────────────────────
+  // Strategy: draw reference video frame scaled to face area, then composite
+  // with the live camera frame so expressions/movement show through naturally.
+  const applyFaceBlend = (
+    ctx: OffscreenCanvasRenderingContext2D,
+    refVid: HTMLVideoElement,
+    W: number,
+    H: number,
+  ) => {
+    // Estimate face region (upper-centre of frame)
+    const fx = W * 0.25;
+    const fy = H * 0.03;
+    const fw = W * 0.50;
+    const fh = H * 0.70;
+
+    // Temp canvas: reference video cropped to same face region
+    const tmp = new OffscreenCanvas(W, H);
+    const tCtx = tmp.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
+    if (!tCtx) return;
+
+    // Draw reference video filling entire canvas (it will be clipped by ellipse)
+    tCtx.drawImage(refVid, 0, 0, W, H);
+
+    // Soft elliptical mask for the face/body region → no hard edge
+    const grad = tCtx.createRadialGradient(
+      W * 0.5, H * 0.38, 0,
+      W * 0.5, H * 0.38, Math.min(fw, fh) * 0.62,
+    );
+    grad.addColorStop(0,   'rgba(0,0,0,1)');
+    grad.addColorStop(0.6, 'rgba(0,0,0,0.85)');
+    grad.addColorStop(1,   'rgba(0,0,0,0)');
+
+    tCtx.globalCompositeOperation = 'destination-in';
+    tCtx.fillStyle = grad;
+    tCtx.fillRect(0, 0, W, H);
+    tCtx.globalCompositeOperation = 'source-over';
+
+    // Blend reference frame on top of live frame with ~75 % opacity inside the ellipse
+    ctx.globalAlpha = 0.80;
+    ctx.drawImage(tmp, 0, 0);
+    ctx.globalAlpha = 1.0;
   };
 
+  // ─── Background update ───────────────────────────────────────────────────────
   const updateBackground = useCallback((backgroundId: string) => {
-    const bgOption = backgroundOptions.find(opt => opt.id === backgroundId);
-    const bgValue = bgOption?.value || '';
+    const opt    = backgroundOptions.find(o => o.id === backgroundId);
+    const bgVal  = opt?.value ?? '';
 
-    currentBackgroundRef.current = bgValue;
+    currentBgRef.current = bgVal;
+    setTransformationSettings(prev => ({ ...prev, background: bgVal }));
 
-    setTransformationSettings(prev => ({
-      ...prev,
-      background: bgValue,
-    }));
-
-    if (bgValue) {
-      setStatusMessage('Loading background...');
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.src = bgValue;
-
-      img.onload = () => {
-        backgroundImgRef.current = img;
-        setStatusMessage('Background Active');
-      };
-
-      img.onerror = () => {
-        backgroundImgRef.current = null;
-        setStatusMessage('Background Load Failed');
-      };
-    } else {
+    if (!bgVal) {
       backgroundImgRef.current = null;
       setStatusMessage('Camera Ready');
+      return;
     }
+
+    setStatusMessage('Loading background...');
+    const img   = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload  = () => { backgroundImgRef.current = img; setStatusMessage('Background Active'); };
+    img.onerror = () => { backgroundImgRef.current = null; setStatusMessage('Background load failed'); };
+    img.src     = bgVal;
   }, []);
 
+  // ─── Cleanup ────────────────────────────────────────────────────────────────
   const cleanup = useCallback(() => {
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
-
-    if (selfieSegmentationRef.current) {
-      try {
-        selfieSegmentationRef.current.close();
-      } catch (e) {}
-      selfieSegmentationRef.current = null;
-    }
-
-    if (videoRef.current) {
-      videoRef.current.pause();
-      videoRef.current.srcObject = null;
-      videoRef.current = null;
-    }
-
-    if (referenceVideo) {
-      referenceVideo.pause();
-      referenceVideo.src = '';
-    }
-
-    inputStreamRef.current = null;
-    backgroundImgRef.current = null;
-    outputCanvasRef.current = null;
-    currentBackgroundRef.current = '';
-    referenceVideoRef.current = null;
-    isInitializedRef.current = false;
-
+    if (animationFrameRef.current) { cancelAnimationFrame(animationFrameRef.current); animationFrameRef.current = null; }
+    try { selfieSegRef.current?.close(); } catch { /* noop */ }
+    selfieSegRef.current = null;
+    if (videoRef.current) { videoRef.current.pause(); videoRef.current.srcObject = null; videoRef.current = null; }
+    backgroundImgRef.current   = null;
+    outputCanvasRef.current    = null;
+    currentBgRef.current       = '';
+    refVideoRef.current        = null;
+    isProcessingRef.current    = false;
+    scriptLoadedRef.current    = false;
     setProcessedStream(null);
     setIsProcessing(false);
     setStatusMessage('Camera Ready');
-    isProcessingRef.current = false;
-  }, [referenceVideo]);
+  }, []);
 
-  useEffect(() => {
-    return () => {
-      cleanup();
-    };
-  }, [cleanup]);
+  useEffect(() => () => { cleanup(); }, [cleanup]);
 
   return {
     processedStream,
