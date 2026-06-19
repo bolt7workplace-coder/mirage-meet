@@ -87,9 +87,6 @@ export function useWebRTC(_roomId: string | null, _processedStream: MediaStream 
     }
   }, []);
 
-  const getActiveStream = useCallback(() => {
-    return processedStreamRef.current || localStreamRef.current;
-  }, []);
 
   const createPeerConnection = useCallback((userId: string) => {
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
