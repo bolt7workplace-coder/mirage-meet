@@ -1,6 +1,6 @@
 import { useRef, useState, useCallback, useEffect } from 'react';
 import type * as OrtType from 'onnxruntime-web';
-import * as faceLandmarksDetection from '@tensorflow-models/face-landmarks-detection';
+import type * as FaceLandmarksDetectionType from '@tensorflow-models/face-landmarks-detection';
 import type { TransformationSettings, BackgroundOption } from '../types';
 
 interface UseFaceTransformReturn {
@@ -95,8 +95,8 @@ export function useFaceTransform(): UseFaceTransformReturn {
   const animFrameRef = useRef<number | null>(null);
   const bgImgRef = useRef<HTMLImageElement | null>(null);
 
-  // TensorFlow.js face landmark detector
-  const detectorRef = useRef<faceLandmarksDetection.FaceLandmarksDetector | null>(null);
+  // TensorFlow.js face landmark detector (loaded lazily)
+  const detectorRef = useRef<FaceLandmarksDetectionType.FaceLandmarksDetector | null>(null);
 
   // Lazily-loaded onnxruntime-web module (dynamic import to avoid blocking page load)
   const ortRef = useRef<typeof OrtType | null>(null);
@@ -153,10 +153,11 @@ export function useFaceTransform(): UseFaceTransformReturn {
     selfieSegRef.current = seg;
   }, [loadScript]);
 
-  // Initialize TensorFlow.js face detector
+  // Initialize TensorFlow.js face detector (dynamically imported to avoid blocking page render)
   const initDetector = useCallback(async () => {
     suppressTFLogs();
     setStatus('Loading face detection model...');
+    const faceLandmarksDetection = await import('@tensorflow-models/face-landmarks-detection');
     const detector = await faceLandmarksDetection.createDetector(
       faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh,
       { runtime: 'tfjs', maxFaces: 1, refineLandmarks: false },
