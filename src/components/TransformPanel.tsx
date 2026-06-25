@@ -1,4 +1,4 @@
-import { Upload, X, ChevronLeft, ChevronRight, CheckCircle, AlertCircle, Loader, Sparkles, Image } from 'lucide-react';
+import { X, ChevronLeft, ChevronRight, CheckCircle, AlertCircle, Loader, Sparkles, Image as ImageIcon } from 'lucide-react';
 import { useState, useRef, useEffect } from 'react';
 import type { TransformationSettings } from '../types';
 import { backgroundOptions } from '../hooks/useFaceTransform';
@@ -47,7 +47,7 @@ export default function TransformPanel({
     const url = URL.createObjectURL(file);
     setPreviewUrl(url);
 
-    const img = new Image();
+    const img = document.createElement('img');
     img.src = url;
     img.crossOrigin = 'anonymous';
 
@@ -246,7 +246,7 @@ export default function TransformPanel({
                     </>
                   ) : (
                     <>
-                      <Image size={24} className="text-dark-400 mb-2" />
+                      <ImageIcon size={24} className="text-dark-400 mb-2" />
                       <p className="text-sm text-dark-400">Drop photo or click</p>
                       <p className="text-xs text-dark-500 mt-1">PNG, JPG</p>
                     </>

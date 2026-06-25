@@ -142,8 +142,8 @@ export function useFaceTransform(): UseFaceTransformReturn {
       locateFile: (f: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${f}`,
     });
     detector.setOptions({ modelSelection: 1, minDetectionConfidence: 0.5 });
-    await detector.send({ image: new ImageData(1, 1) }); // warm-up
     faceDetectorRef.current = detector;
+    // Skip warmup — first real call will warm up; warmup with dummy data can crash MediaPipe
     setStatus('Camera Ready');
     console.log('[AI] MediaPipe Face Detection initialized');
   }, [loadScript, setStatus]);
@@ -212,13 +212,9 @@ export function useFaceTransform(): UseFaceTransformReturn {
       console.log('[AI] onnxruntime-web imported');
       setModelLoadProgress(15);
 
-      let executionProviders: string[] = ['wasm'];
-      if (typeof navigator !== 'undefined' && (navigator as any).gpu) {
-        executionProviders = ['webgpu'];
-        console.log('[AI] Using WebGPU backend');
-      } else {
-        console.log('[AI] Using WASM backend');
-      }
+      // Always use wasm backend — WebGPU requires browser flags not available in production
+      const executionProviders: string[] = ['wasm'];
+      console.log('[AI] Using WASM backend');
       setModelLoadProgress(20);
 
       console.log('[AI] Fetching model from:', FACE_SWAP_MODEL_URL);
