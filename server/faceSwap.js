@@ -209,10 +209,14 @@ async function ensureModel(key) {
  */
 async function decodeToRGBA(buffer) {
   const { data, info } = await sharp(buffer)
+    .rotate()           // auto-orient EXIF
     .ensureAlpha()
     .raw()
     .toBuffer({ resolveWithObject: true });
-  return { data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength), width: info.width, height: info.height };
+  // data is a Node Buffer — copy into a plain Uint8Array to avoid pool-slice issues
+  const arr = new Uint8Array(data.byteLength);
+  arr.set(data);
+  return { data: arr, width: info.width, height: info.height };
 }
 
 /**
@@ -224,7 +228,9 @@ async function resizeRGBA(pixels, srcW, srcH, newW, newH) {
     .resize(newW, newH, { fit: 'fill', kernel: 'lanczos3' })
     .raw()
     .toBuffer();
-  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  const arr = new Uint8Array(buf.byteLength);
+  arr.set(buf);
+  return arr;
 }
 
 /**
@@ -357,6 +363,7 @@ function warpAffineBack(pixels, srcW, srcH, M_inv, outW, outH) {
 
 /**
  * Convert RGBA pixel array to CHW float32 blob.
+ * Both ArcFace (w600k_r50) and InSwapper were trained with OpenCV (BGR channel order).
  * norm='arcface': (v-127.5)/128  norm='swapper': v/255
  */
 function pixelsToBlob(pixels, w, h, norm) {
@@ -365,13 +372,15 @@ function pixelsToBlob(pixels, w, h, norm) {
   for (let i = 0; i < n; i++) {
     const r = pixels[i * 4], g = pixels[i * 4 + 1], b = pixels[i * 4 + 2];
     if (norm === 'arcface') {
-      blob[i]         = (r - 127.5) / 128;
+      // BGR order, (x-127.5)/128
+      blob[i]         = (b - 127.5) / 128;
       blob[n + i]     = (g - 127.5) / 128;
-      blob[2 * n + i] = (b - 127.5) / 128;
+      blob[2 * n + i] = (r - 127.5) / 128;
     } else {
-      blob[i]         = r / 255;
+      // InSwapper: BGR order, /255
+      blob[i]         = b / 255;
       blob[n + i]     = g / 255;
-      blob[2 * n + i] = b / 255;
+      blob[2 * n + i] = r / 255;
     }
   }
   return blob;
@@ -382,9 +391,10 @@ function predToPixels(pred, size) {
   const n = size * size;
   const out = new Uint8ClampedArray(n * 4);
   for (let i = 0; i < n; i++) {
-    out[i * 4]     = Math.max(0, Math.min(255, Math.round(pred[i]         * 255)));
-    out[i * 4 + 1] = Math.max(0, Math.min(255, Math.round(pred[n + i]     * 255)));
-    out[i * 4 + 2] = Math.max(0, Math.min(255, Math.round(pred[2 * n + i] * 255)));
+    // InSwapper output is BGR — swap to RGB for our RGBA pixel arrays
+    out[i * 4]     = Math.max(0, Math.min(255, Math.round(pred[2 * n + i] * 255))); // R ← channel 2
+    out[i * 4 + 1] = Math.max(0, Math.min(255, Math.round(pred[n + i]     * 255))); // G ← channel 1
+    out[i * 4 + 2] = Math.max(0, Math.min(255, Math.round(pred[i]         * 255))); // B ← channel 0
     out[i * 4 + 3] = 255;
   }
   return out;
@@ -448,46 +458,54 @@ function decodeSCRFD(outputs, inputW, inputH, threshold = 0.45) {
   return keep;
 }
 
-async function detectFaces(pixels, W, H) {
+async function detectFacesWithThreshold(pixels, W, H, threshold) {
+  return detectFaces(pixels, W, H, threshold);
+}
+
+async function detectFaces(pixels, W, H, threshold = 0.45) {
   const inputSize = 640;
   const scale = Math.min(inputSize / W, inputSize / H);
   const newW = Math.round(W * scale), newH = Math.round(H * scale);
   const padX = Math.floor((inputSize - newW) / 2);
   const padY = Math.floor((inputSize - newH) / 2);
 
-  // Resize + letterbox using sharp
-  const resizedBuf = await sharp(Buffer.from(pixels), { raw: { width: W, height: H, channels: 4 } })
+  // Resize then pad to exactly 640×640 with gray (128) using sharp
+  const paddedBuf = await sharp(Buffer.from(pixels), { raw: { width: W, height: H, channels: 4 } })
     .resize(newW, newH, { fit: 'fill', kernel: 'lanczos3' })
+    .extend({
+      top: padY, bottom: inputSize - newH - padY,
+      left: padX, right: inputSize - newW - padX,
+      background: { r: 128, g: 128, b: 128, alpha: 255 },
+    })
     .raw()
     .toBuffer();
 
-  // Create 640×640 gray canvas, paste resized image
-  const padded = new Uint8Array(inputSize * inputSize * 4);
-  padded.fill(128); // gray letterbox
-  for (let y = 0; y < newH; y++) {
-    for (let x = 0; x < newW; x++) {
-      const si = (y * newW + x) * 4;
-      const di = ((y + padY) * inputSize + (x + padX)) * 4;
-      padded[di]     = resizedBuf[si];
-      padded[di + 1] = resizedBuf[si + 1];
-      padded[di + 2] = resizedBuf[si + 2];
-      padded[di + 3] = 255;
-    }
-  }
+  const padded = new Uint8Array(paddedBuf.byteLength);
+  padded.set(paddedBuf);
 
-  // BGR CHW, mean 127.5 std 128
+  // SCRFD was trained with OpenCV BGR. Input tensor channels must be B, G, R.
   const blob = new Float32Array(3 * inputSize * inputSize);
   const n = inputSize * inputSize;
   for (let i = 0; i < n; i++) {
-    blob[i]         = (padded[i*4]     - 127.5) / 128; // R
+    blob[i]         = (padded[i*4 + 2] - 127.5) / 128; // B
     blob[n + i]     = (padded[i*4 + 1] - 127.5) / 128; // G
-    blob[2*n + i]   = (padded[i*4 + 2] - 127.5) / 128; // B
+    blob[2*n + i]   = (padded[i*4]     - 127.5) / 128; // R
   }
 
+  const detInputName = sessions.det.inputNames[0];
   const result = await sessions.det.run({
-    input: new Tensor('float32', blob, [1, 3, inputSize, inputSize]),
+    [detInputName]: new Tensor('float32', blob, [1, 3, inputSize, inputSize]),
   });
-  const faces = decodeSCRFD(Object.values(result), inputSize, inputSize);
+
+  // Output names from SCRFD follow a fixed stride order:
+  // score_8, bbox_8, kps_8, score_16, bbox_16, kps_16, score_32, bbox_32, kps_32
+  // Sort by name to guarantee correct ordering before decoding.
+  const sortedOutputs = sessions.det.outputNames
+    .map(n => ({ name: n, tensor: result[n] }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map(o => o.tensor);
+
+  const faces = decodeSCRFD(sortedOutputs, inputSize, inputSize, threshold);
 
   // Rescale to original coords
   return faces.map(f => ({
@@ -723,13 +741,31 @@ export async function initialize(onProgress) {
 export async function registerReferenceFace(imageBuffer) {
   if (initState !== 'ready') throw new Error(`Engine not ready (${initState})`);
 
-  const { data, width, height } = await decodeToRGBA(imageBuffer);
-  const faces = await detectFaces(data, width, height);
-  const best  = getBestFace(faces);
-  if (!best) throw new Error('No face detected in reference image');
+  console.log('[FaceSwap] Received image, size:', imageBuffer.length, 'bytes');
 
+  const { data, width, height } = await decodeToRGBA(imageBuffer);
+  console.log('[FaceSwap] Decoded image:', width, 'x', height);
+
+  console.log('[FaceSwap] Running face detection...');
+  const faces = await detectFaces(data, width, height);
+  console.log('[FaceSwap] Faces detected:', faces.length, faces.map(f => `score=${f.score.toFixed(2)}`));
+
+  const best = getBestFace(faces);
+  if (!best) {
+    // Retry with a lower threshold in case the photo has unusual lighting
+    console.log('[FaceSwap] No face above threshold, retrying with lower threshold...');
+    const facesLow = await detectFacesWithThreshold(data, width, height, 0.2);
+    console.log('[FaceSwap] Low-threshold faces:', facesLow.length);
+    const bestLow = getBestFace(facesLow);
+    if (!bestLow) throw new Error('No face detected in reference image — ensure the photo shows a clear frontal face');
+    referenceEmbedding = await getEmbedding(data, width, height, bestLow.kps);
+    console.log('[FaceSwap] Embedding created (low-threshold), dim:', referenceEmbedding.length);
+    return { success: true, bbox: { x1: bestLow.x1, y1: bestLow.y1, x2: bestLow.x2, y2: bestLow.y2 } };
+  }
+
+  console.log('[FaceSwap] Best face bbox:', best.x1.toFixed(0), best.y1.toFixed(0), best.x2.toFixed(0), best.y2.toFixed(0));
   referenceEmbedding = await getEmbedding(data, width, height, best.kps);
-  console.log('[FaceSwap] Reference embedded, dim:', referenceEmbedding.length);
+  console.log('[FaceSwap] Embedding created, dim:', referenceEmbedding.length);
   return { success: true, bbox: { x1: best.x1, y1: best.y1, x2: best.x2, y2: best.y2 } };
 }
 

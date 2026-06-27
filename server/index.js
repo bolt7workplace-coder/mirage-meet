@@ -63,12 +63,16 @@ app.get('/ai/status', (req, res) => {
 
 // Register reference face (host uploads a photo)
 app.post('/ai/register-face', upload.single('image'), async (req, res) => {
+  console.log('[Server] /ai/register-face hit, file:', req.file ? `${req.file.originalname} ${req.file.size}B mimetype=${req.file.mimetype}` : 'MISSING');
   try {
-    if (!req.file) return res.status(400).json({ error: 'No image provided' });
+    if (!req.file) {
+      console.error('[Server] register-face: no file in request. Fields:', Object.keys(req.body || {}));
+      return res.status(400).json({ error: 'No image provided — ensure field name is "image"' });
+    }
     const result = await registerReferenceFace(req.file.buffer);
     res.json(result);
   } catch (err) {
-    console.error('[Server] register-face error:', err);
+    console.error('[Server] register-face error:', err.message, err.stack?.split('\n')[1] || '');
     res.status(400).json({ error: err.message });
   }
 });
@@ -78,11 +82,12 @@ app.post('/ai/transform-frame', upload.single('frame'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No frame provided' });
     const resultJpeg = await transformFrame(req.file.buffer);
-    if (!resultJpeg) return res.status(204).end(); // no face detected, use original
+    if (!resultJpeg) return res.status(204).end();
     res.set('Content-Type', 'image/jpeg');
+    res.set('Access-Control-Allow-Origin', '*');
     res.send(resultJpeg);
   } catch (err) {
-    console.error('[Server] transform-frame error:', err);
+    console.error('[Server] transform-frame error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
