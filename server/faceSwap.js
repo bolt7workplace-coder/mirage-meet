@@ -260,8 +260,9 @@ const ARCFACE_DST = [
 function estimateNorm(srcKps, imageSize = 112) {
   const ratio = imageSize / 112.0;
   const dx    = imageSize % 128 === 0 ? 8.0 * ratio : 0;
+  const dy    = imageSize % 128 === 0 ? 8.0 * ratio : 0; // offset both X and Y for 128x128
   const dstX  = ARCFACE_DST.filter((_, i) => i % 2 === 0).map(v => v * ratio + dx);
-  const dstY  = ARCFACE_DST.filter((_, i) => i % 2 !== 0).map(v => v * ratio);
+  const dstY  = ARCFACE_DST.filter((_, i) => i % 2 !== 0).map(v => v * ratio + dy);
 
   const srcX = srcKps.filter((_, i) => i % 2 === 0);
   const srcY = srcKps.filter((_, i) => i % 2 !== 0);
@@ -364,7 +365,7 @@ function warpAffineBack(pixels, srcW, srcH, M_inv, outW, outH) {
 /**
  * Convert RGBA pixel array to CHW float32 blob.
  * Both ArcFace (w600k_r50) and InSwapper were trained with OpenCV (BGR channel order).
- * norm='arcface': (v-127.5)/128  norm='swapper': v/255
+ * norm='arcface': (v-127.5)/128  norm='swapper': (v-127.5)/127.5 (same as ArcFace, input range -1 to 1)
  */
 function pixelsToBlob(pixels, w, h, norm) {
   const n = w * h;
@@ -377,24 +378,25 @@ function pixelsToBlob(pixels, w, h, norm) {
       blob[n + i]     = (g - 127.5) / 128;
       blob[2 * n + i] = (r - 127.5) / 128;
     } else {
-      // InSwapper: BGR order, /255
-      blob[i]         = b / 255;
-      blob[n + i]     = g / 255;
-      blob[2 * n + i] = r / 255;
+      // InSwapper: BGR order, normalized to [-1, 1] via (x-127.5)/127.5
+      blob[i]         = (b - 127.5) / 127.5;
+      blob[n + i]     = (g - 127.5) / 127.5;
+      blob[2 * n + i] = (r - 127.5) / 127.5;
     }
   }
   return blob;
 }
 
-/** Convert CHW float32 prediction [0,1] → RGBA Uint8ClampedArray. */
+/** Convert CHW float32 prediction [-1,1] → RGBA Uint8ClampedArray. */
 function predToPixels(pred, size) {
   const n = size * size;
   const out = new Uint8ClampedArray(n * 4);
   for (let i = 0; i < n; i++) {
-    // InSwapper output is BGR — swap to RGB for our RGBA pixel arrays
-    out[i * 4]     = Math.max(0, Math.min(255, Math.round(pred[2 * n + i] * 255))); // R ← channel 2
-    out[i * 4 + 1] = Math.max(0, Math.min(255, Math.round(pred[n + i]     * 255))); // G ← channel 1
-    out[i * 4 + 2] = Math.max(0, Math.min(255, Math.round(pred[i]         * 255))); // B ← channel 0
+    // InSwapper output is RGB (channel 0=R, 1=G, 2=B) with values in [-1, 1]
+    // Convert to [0, 255]: (x + 1) * 127.5
+    out[i * 4]     = Math.max(0, Math.min(255, Math.round((pred[i]         + 1) * 127.5))); // R ← channel 0
+    out[i * 4 + 1] = Math.max(0, Math.min(255, Math.round((pred[n + i]     + 1) * 127.5))); // G ← channel 1
+    out[i * 4 + 2] = Math.max(0, Math.min(255, Math.round((pred[2 * n + i] + 1) * 127.5))); // B ← channel 2
     out[i * 4 + 3] = 255;
   }
   return out;
