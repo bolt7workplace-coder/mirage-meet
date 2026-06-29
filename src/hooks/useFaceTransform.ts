@@ -14,6 +14,7 @@ interface UseFaceTransformReturn {
   initializeTransform: (stream: MediaStream) => Promise<void>;
   updateBackground: (backgroundId: string) => void;
   cleanup: () => void;
+  debugFrameUrl: string | null;
 }
 
 export const backgroundOptions: BackgroundOption[] = [
@@ -60,6 +61,8 @@ export function useFaceTransform(): UseFaceTransformReturn {
   const [isProcessing, setIsProcessing] = useState(false);
   const [statusMessage, setStatusMessage] = useState('Camera Ready');
   const [modelLoadProgress, setModelLoadProgress] = useState(0);
+  const [debugFrameUrl, setDebugFrameUrl] = useState<string | null>(null);
+  const debugFrameUrlRef = useRef<string | null>(null);
   const [transformationSettings, setTransformationSettings] = useState<TransformationSettings>({
     enabled: false,
     referenceImage: null,
@@ -250,6 +253,13 @@ export function useFaceTransform(): UseFaceTransformReturn {
       const jpegBlob = await res.blob();
       console.log('[Transform] Received transformed frame, size:', jpegBlob.size, 'bytes');
       const url = URL.createObjectURL(jpegBlob);
+
+      // Capture a separate blob URL for the debug panel — independent lifecycle from swapped frame
+      const debugUrl = URL.createObjectURL(jpegBlob);
+      if (debugFrameUrlRef.current) URL.revokeObjectURL(debugFrameUrlRef.current);
+      debugFrameUrlRef.current = debugUrl;
+      setDebugFrameUrl(debugUrl);
+
       const img = new Image();
       img.onload = () => {
         console.log('[Transform] Transformed frame loaded, dims:', img.naturalWidth, 'x', img.naturalHeight);
@@ -344,23 +354,19 @@ export function useFaceTransform(): UseFaceTransformReturn {
 
     // 2. Person layer (transformed or original)
     const hasValidSwap = s.enabled && swapped != null && swapped.complete && swapped.naturalWidth > 0;
+    const sourceFrame = hasValidSwap ? swapped! : vid;
+    if (frameRef.current % 60 === 0 && hasValidSwap) console.log('[DEBUG] Using transformed frame as output');
 
-    if (hasValidSwap) {
-      // AI swap is active — draw the full transformed frame directly, no compositing.
-      // The server already composited the swapped face onto the original background.
-      if (frameRef.current % 60 === 0) console.log('[DEBUG] Using transformed frame as output');
-      ctx.drawImage(swapped!, 0, 0, W, H);
-    } else if (seg?.segmentationMask && bgVal) {
-      // Background replacement without face swap
+    if (seg?.segmentationMask && bgVal) {
       const personOff = new OffscreenCanvas(W, H);
       const pCtx = personOff.getContext('2d') as OffscreenCanvasRenderingContext2D;
-      pCtx.drawImage(vid, 0, 0, W, H);
+      pCtx.drawImage(sourceFrame, 0, 0, W, H);
       pCtx.globalCompositeOperation = 'destination-in';
       pCtx.drawImage(seg.segmentationMask, 0, 0, W, H);
       pCtx.globalCompositeOperation = 'source-over';
       ctx.drawImage(personOff, 0, 0);
     } else {
-      ctx.drawImage(vid, 0, 0, W, H);
+      ctx.drawImage(sourceFrame, 0, 0, W, H);
     }
 
     // Status — use same valid-swap check as sourceFrame selection
@@ -442,6 +448,8 @@ export function useFaceTransform(): UseFaceTransformReturn {
     if (hostVideoRef.current) { hostVideoRef.current.pause(); hostVideoRef.current.srcObject = null; hostVideoRef.current = null; }
     if (swappedFrameRef.current?.src?.startsWith('blob:')) URL.revokeObjectURL(swappedFrameRef.current.src);
     swappedFrameRef.current = null;
+    if (debugFrameUrlRef.current) { URL.revokeObjectURL(debugFrameUrlRef.current); debugFrameUrlRef.current = null; }
+    setDebugFrameUrl(null);
     bgImgRef.current = null;
     outputCanvasRef.current = null;
     segResultRef.current = null;
@@ -473,5 +481,6 @@ export function useFaceTransform(): UseFaceTransformReturn {
     initializeTransform,
     updateBackground,
     cleanup,
+    debugFrameUrl,
   };
 }

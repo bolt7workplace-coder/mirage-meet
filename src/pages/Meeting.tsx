@@ -7,7 +7,7 @@ import { useWebRTC } from '../hooks/useWebRTC';
 import { useFaceTransform } from '../hooks/useFaceTransform';
 import { socket } from '../lib/socket';
 import {
-  Video, VideoOff, Mic, MicOff, PhoneOff, Copy, Check, Users, PanelRightOpen, AlertCircle
+  Video, VideoOff, Mic, MicOff, PhoneOff, Copy, Check, Users, PanelRightOpen, AlertCircle, Download
 } from 'lucide-react';
 
 export default function Meeting() {
@@ -43,6 +43,7 @@ export default function Meeting() {
     statusMessage,
     modelLoadProgress,
     cleanup: cleanupTransform,
+    debugFrameUrl,
   } = useFaceTransform();
 
   useEffect(() => {
@@ -371,6 +372,32 @@ export default function Meeting() {
           />
         )}
       </div>
+
+      {/* DEBUG: raw AI output panel — shows the JPEG returned from the server before any canvas processing */}
+      {debugFrameUrl && isAdmin && (
+        <div className="fixed bottom-24 left-4 z-50 bg-dark-900 border border-yellow-500 rounded-xl overflow-hidden shadow-2xl w-64">
+          <div className="flex items-center justify-between px-3 py-2 bg-yellow-500/20 border-b border-yellow-500/40">
+            <span className="text-xs font-mono font-bold text-yellow-400">RAW AI OUTPUT (DEBUG)</span>
+            <a
+              href={debugFrameUrl}
+              download="ai-output.jpg"
+              className="flex items-center gap-1 px-2 py-1 bg-yellow-500 hover:bg-yellow-400 rounded text-xs text-dark-900 font-bold transition-colors"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <Download size={10} />
+              Save
+            </a>
+          </div>
+          <img
+            src={debugFrameUrl}
+            alt="Raw AI output"
+            className="w-full block"
+          />
+          <p className="text-xs text-dark-400 px-3 py-2">
+            This is the exact JPEG from /ai/transform-frame. If face is unchanged here, bug is in the AI pipeline.
+          </p>
+        </div>
+      )}
 
       {/* Footer controls */}
       <footer className="flex-shrink-0 h-16 md:h-20 bg-dark-900/90 backdrop-blur-sm border-t border-dark-700 flex items-center justify-center gap-3 md:gap-4 px-4 z-30">
