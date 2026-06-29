@@ -57,6 +57,7 @@ export default function TransformPanel({
       setTransformationSettings(prev => ({
         ...prev,
         referenceImage: url,
+        enabled: true,
       }));
     };
 

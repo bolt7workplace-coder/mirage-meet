@@ -344,18 +344,23 @@ export function useFaceTransform(): UseFaceTransformReturn {
 
     // 2. Person layer (transformed or original)
     const hasValidSwap = s.enabled && swapped != null && swapped.complete && swapped.naturalWidth > 0;
-    const sourceFrame = hasValidSwap ? swapped! : vid;
 
-    if (seg?.segmentationMask && bgVal) {
+    if (hasValidSwap) {
+      // AI swap is active — draw the full transformed frame directly, no compositing.
+      // The server already composited the swapped face onto the original background.
+      if (frameRef.current % 60 === 0) console.log('[DEBUG] Using transformed frame as output');
+      ctx.drawImage(swapped!, 0, 0, W, H);
+    } else if (seg?.segmentationMask && bgVal) {
+      // Background replacement without face swap
       const personOff = new OffscreenCanvas(W, H);
       const pCtx = personOff.getContext('2d') as OffscreenCanvasRenderingContext2D;
-      pCtx.drawImage(sourceFrame, 0, 0, W, H);
+      pCtx.drawImage(vid, 0, 0, W, H);
       pCtx.globalCompositeOperation = 'destination-in';
       pCtx.drawImage(seg.segmentationMask, 0, 0, W, H);
       pCtx.globalCompositeOperation = 'source-over';
       ctx.drawImage(personOff, 0, 0);
     } else {
-      ctx.drawImage(sourceFrame, 0, 0, W, H);
+      ctx.drawImage(vid, 0, 0, W, H);
     }
 
     // Status — use same valid-swap check as sourceFrame selection
