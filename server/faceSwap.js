@@ -715,10 +715,11 @@ async function runSwapper(pixels, W, H, kps, srcEmbedding) {
   return { pred: result[outN].data, M, aligned };
 }
 
-// ─── Paste-back with face-shaped mask and seamless blending ────────────────────
+// ─── Paste-back: face-shaped mask + luminance-only lighting correction ─────────
 
 function gaussianBlur1ch(src, w, h, r) {
-  const k = r * 2 + 1, sigma = r / 3;
+  if (r < 1) return src;
+  const k = r * 2 + 1, sigma = r / 2.5;
   const kern = new Float32Array(k);
   let s = 0;
   for (let i = 0; i < k; i++) { const x = i - r; kern[i] = Math.exp(-(x*x)/(2*sigma*sigma)); s += kern[i]; }
@@ -742,26 +743,43 @@ function gaussianBlur1ch(src, w, h, r) {
 }
 
 /**
- * Generate an elliptical face mask in the 128x128 canonical space.
- * This covers the full face region (forehead, cheeks, jaw) without hard rectangular edges.
- * The mask is then warped back to the original image coordinates.
+ * Build an elliptical face mask in the 128×128 canonical InSwapper space.
+ *
+ * Critical: The InsightFace canonical alignment positions the face landmarks at
+ * specific pixel coordinates when scaled to 128×128 (ratio = 128/112 ≈ 1.143):
+ *   Eyes: y ≈ 59,  Mouth corners: y ≈ 105
+ *
+ * Face center is between eyes and mouth: cy ≈ (59+105)/2 = 82, cx ≈ 64.
+ * The ellipse must be anchored here, NOT at (64,64) which is above the eye line.
+ *
+ * Vertical coverage:
+ *   Top (forehead): eye_y - 1.4 * (mouth_y - eye_y) ≈ 59 - 64 ≈ -5  → clipped to 0
+ *   Bottom (chin):  mouth_y + 0.35 * (mouth_y - eye_y) ≈ 105 + 16 ≈ 121
  */
 function generateFaceMask(swapSize) {
-  const mask = new Float32Array(swapSize * swapSize);
-  const cx = swapSize / 2;
-  const cy = swapSize / 2;
-  // Ellipse dimensions: wider than tall to cover forehead and jaw
-  const rx = swapSize * 0.42;  // horizontal radius (covers cheeks)
-  const ry = swapSize * 0.48;  // vertical radius (covers forehead to chin)
+  const ratio = swapSize / 112.0;
+  // Canonical landmark y positions scaled to swapSize
+  const eyeY    = 51.6 * ratio;   // ≈ 59 at 128
+  const mouthY  = 92.2 * ratio;   // ≈ 105 at 128
+  const faceH   = mouthY - eyeY;  // ≈ 46
 
+  const cx = swapSize / 2;                         // ≈ 64: horizontally centered
+  const cy = eyeY + faceH * 0.5;                   // ≈ 82: true vertical face center
+
+  // Extend upward to cover forehead and downward to cover chin
+  const ry = faceH * 1.45;   // total vertical reach: eye-to-mouth * 2.9 → forehead + chin
+  const rx = swapSize * 0.44; // horizontal: slightly less than half-width
+
+  const mask = new Float32Array(swapSize * swapSize);
   for (let y = 0; y < swapSize; y++) {
     for (let x = 0; x < swapSize; x++) {
       const dx = (x - cx) / rx;
       const dy = (y - cy) / ry;
-      const dist = dx * dx + dy * dy;
-      // Smooth falloff from 255 at center to 0 at edge
-      if (dist < 1) {
-        mask[y * swapSize + x] = 255 * (1 - dist * dist);  // Quadratic falloff for smoother edges
+      const d2 = dx * dx + dy * dy;
+      if (d2 < 1.0) {
+        // Smooth cosine falloff: 1.0 at centre → 0.0 at edge
+        const t = 1.0 - d2;
+        mask[y * swapSize + x] = 255 * t * t;
       }
     }
   }
@@ -769,61 +787,42 @@ function generateFaceMask(swapSize) {
 }
 
 /**
- * Color transfer: adjust swapped face colors to match target face statistics.
- * Applies full color correction in the interior, fading only at edges.
+ * Luminance-only lighting correction.
+ *
+ * The Reinhard full-RGB transfer was WRONG for face swap: it sampled the
+ * original person's dark skin mean and forced it onto the reference face,
+ * turning a light-skinned reference into a dark glowing blob.
+ *
+ * Correct approach: preserve the reference identity's colors entirely.
+ * Only compute the camera lighting ratio (target_lum / swapped_lum) and
+ * scale the swapped face brightness to match ambient lighting.
+ * Clamp the ratio to [0.6, 1.8] so extreme lighting differences don't
+ * create unrealistic results.
  */
-function colorTransfer(warped, target, mask, W, H) {
-  // Compute mean/std for target face region (where mask > 200)
-  let tCount = 0, tSumR = 0, tSumG = 0, tSumB = 0;
-  let sCount = 0, sSumR = 0, sSumG = 0, sSumB = 0;
-
+function applyLuminanceCorrection(warped, target, mask, W, H) {
+  let tLumSum = 0, sLumSum = 0, count = 0;
   for (let i = 0; i < W * H; i++) {
     if (mask[i] > 200) {
-      tCount++;
-      tSumR += target[i*4];
-      tSumG += target[i*4+1];
-      tSumB += target[i*4+2];
-      sCount++;
-      sSumR += warped[i*4];
-      sSumG += warped[i*4+1];
-      sSumB += warped[i*4+2];
+      // BT.601 luminance
+      tLumSum += 0.299 * target[i*4] + 0.587 * target[i*4+1] + 0.114 * target[i*4+2];
+      sLumSum += 0.299 * warped[i*4] + 0.587 * warped[i*4+1] + 0.114 * warped[i*4+2];
+      count++;
     }
   }
-  if (tCount < 100) return warped;
+  if (count < 50 || sLumSum < 1) return warped; // insufficient data — skip
 
-  const tMeanR = tSumR / tCount, tMeanG = tSumG / tCount, tMeanB = tSumB / tCount;
-  const sMeanR = sSumR / sCount, sMeanG = sSumG / sCount, sMeanB = sSumB / sCount;
+  // Lighting scale: how much brighter/darker the camera makes the scene
+  const scale = Math.max(0.6, Math.min(1.8, tLumSum / sLumSum));
+  if (Math.abs(scale - 1.0) < 0.05) return warped; // negligible — skip
 
-  // Second pass for variance
-  let tVarR = 0, tVarG = 0, tVarB = 0;
-  let sVarR = 0, sVarG = 0, sVarB = 0;
+  const corrected = new Uint8ClampedArray(warped.length);
   for (let i = 0; i < W * H; i++) {
-    if (mask[i] > 200) {
-      tVarR += (target[i*4] - tMeanR) ** 2;
-      tVarG += (target[i*4+1] - tMeanG) ** 2;
-      tVarB += (target[i*4+2] - tMeanB) ** 2;
-      sVarR += (warped[i*4] - sMeanR) ** 2;
-      sVarG += (warped[i*4+1] - sMeanG) ** 2;
-      sVarB += (warped[i*4+2] - sMeanB) ** 2;
-    }
-  }
-  const tStdR = Math.sqrt(tVarR / tCount) + 1e-6;
-  const tStdG = Math.sqrt(tVarG / tCount) + 1e-6;
-  const tStdB = Math.sqrt(tVarB / tCount) + 1e-6;
-  const sStdR = Math.sqrt(sVarR / sCount) + 1e-6;
-  const sStdG = Math.sqrt(sVarG / sCount) + 1e-6;
-  const sStdB = Math.sqrt(sVarB / sCount) + 1e-6;
-
-  // Apply color transfer - full correction everywhere, no fade based on mask
-  const corrected = new Uint8ClampedArray(W * H * 4);
-  for (let i = 0; i < W * H; i++) {
-    if (mask[i] > 10) {
-      const r = ((warped[i*4] - sMeanR) / sStdR) * tStdR + tMeanR;
-      const g = ((warped[i*4+1] - sMeanG) / sStdG) * tStdG + tMeanG;
-      const b = ((warped[i*4+2] - sMeanB) / sStdB) * tStdB + tMeanB;
-      corrected[i*4]   = Math.max(0, Math.min(255, Math.round(r)));
-      corrected[i*4+1] = Math.max(0, Math.min(255, Math.round(g)));
-      corrected[i*4+2] = Math.max(0, Math.min(255, Math.round(b)));
+    const m = mask[i] / 255;
+    if (m > 0.01) {
+      // Scale brightness proportionally; preserve color ratios (no skin-tone shift)
+      corrected[i*4]   = Math.max(0, Math.min(255, Math.round(warped[i*4]   * (1 + m * (scale - 1)))));
+      corrected[i*4+1] = Math.max(0, Math.min(255, Math.round(warped[i*4+1] * (1 + m * (scale - 1)))));
+      corrected[i*4+2] = Math.max(0, Math.min(255, Math.round(warped[i*4+2] * (1 + m * (scale - 1)))));
     } else {
       corrected[i*4]   = warped[i*4];
       corrected[i*4+1] = warped[i*4+1];
@@ -834,32 +833,20 @@ function colorTransfer(warped, target, mask, W, H) {
   return corrected;
 }
 
-function pasteBack(targetPixels, W, H, pred, M, swapSize, kps) {
+function pasteBack(targetPixels, W, H, pred, M, swapSize) {
   const fakePx = predToPixels(pred, swapSize);
   const [a, b, tx, c, d, ty] = M;
 
-  // Generate elliptical face mask in canonical 128x128 space
+  // Elliptical face mask anchored at true canonical face center
   const canonicalMask = generateFaceMask(swapSize);
 
-  // Backward mapping: for each output pixel (x,y) in the full frame, apply M to get
-  // the corresponding canonical position in the 128×128 InSwapper output.
-  // Also warp the face mask from canonical space to image coordinates.
+  // For each pixel in the full frame, map to canonical 128×128 space with M,
+  // then bilinear-sample both the swapped face pixels and the face mask.
   const warped  = new Uint8ClampedArray(W * H * 4);
   const rawMask = new Float32Array(W * H);
 
-  // Inverse of M for backward mapping
-  const det = a * d - b * c;
-  let ia, ib, itx, ic, id2, ity;
-  if (Math.abs(det) < 1e-10) {
-    ia = 1; ib = 0; itx = 0; ic = 0; id2 = 1; ity = 0;
-  } else {
-    ia = d / det; ib = -b / det; itx = (b * ty - d * tx) / det;
-    ic = -c / det; id2 = a / det; ity = (c * tx - a * ty) / det;
-  }
-
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
-      // Map image coordinates to canonical 128x128 space
       const sx = a * x + b * y + tx;
       const sy = c * x + d * y + ty;
       const x0 = Math.floor(sx), y0 = Math.floor(sy);
@@ -869,45 +856,37 @@ function pasteBack(targetPixels, W, H, pred, M, swapSize, kps) {
         const fx = sx - x0, fy = sy - y0;
         const w00=(1-fx)*(1-fy), w10=fx*(1-fy), w01=(1-fx)*fy, w11=fx*fy;
 
-        // Bilinear sample from swapped face
         const i00=(y0*swapSize+x0)*4, i10=(y0*swapSize+x1)*4;
         const i01=(y1*swapSize+x0)*4, i11=(y1*swapSize+x1)*4;
         const di = (y*W+x)*4;
+
         warped[di]   = Math.round(w00*fakePx[i00]  +w10*fakePx[i10]  +w01*fakePx[i01]  +w11*fakePx[i11]);
         warped[di+1] = Math.round(w00*fakePx[i00+1]+w10*fakePx[i10+1]+w01*fakePx[i01+1]+w11*fakePx[i11+1]);
         warped[di+2] = Math.round(w00*fakePx[i00+2]+w10*fakePx[i10+2]+w01*fakePx[i01+2]+w11*fakePx[i11+2]);
         warped[di+3] = 255;
 
-        // Bilinear sample from canonical mask
-        const m00 = canonicalMask[y0*swapSize+x0];
-        const m10 = canonicalMask[y0*swapSize+x1];
-        const m01 = canonicalMask[y1*swapSize+x0];
-        const m11 = canonicalMask[y1*swapSize+x1];
-        rawMask[y*W+x] = w00*m00 + w10*m10 + w01*m01 + w11*m11;
+        // Warp the mask along with the face
+        rawMask[y*W+x] = w00*canonicalMask[y0*swapSize+x0] + w10*canonicalMask[y0*swapSize+x1]
+                       + w01*canonicalMask[y1*swapSize+x0] + w11*canonicalMask[y1*swapSize+x1];
       }
     }
   }
 
-  // Strong Gaussian blur for very smooth edge blending
-  const blurR = Math.max(15, Math.floor(Math.sqrt(W*H/(480*360))*18));
+  // Moderate Gaussian blur for smooth edges without destroying sharpness
+  const blurR = Math.max(6, Math.round(Math.sqrt(W * H) / 80));
   const mask  = gaussianBlur1ch(rawMask, W, H, blurR);
 
-  // Apply color transfer to match target skin tones and lighting
-  const colorCorrected = colorTransfer(warped, targetPixels, mask, W, H);
+  // Luminance-only lighting correction (does NOT change reference skin tone/identity)
+  const corrected = applyLuminanceCorrection(warped, targetPixels, mask, W, H);
 
-  // Final blend: swapped face in masked region, original image elsewhere
+  // Single-pass alpha composite: swapped face over original
   const out = new Uint8ClampedArray(W * H * 4);
   for (let i = 0; i < W * H; i++) {
     const alpha = mask[i] / 255;
-    if (alpha > 0.001) {
-      out[i*4]   = Math.round(alpha * colorCorrected[i*4]   + (1-alpha) * targetPixels[i*4]);
-      out[i*4+1] = Math.round(alpha * colorCorrected[i*4+1] + (1-alpha) * targetPixels[i*4+1]);
-      out[i*4+2] = Math.round(alpha * colorCorrected[i*4+2] + (1-alpha) * targetPixels[i*4+2]);
-    } else {
-      out[i*4]   = targetPixels[i*4];
-      out[i*4+1] = targetPixels[i*4+1];
-      out[i*4+2] = targetPixels[i*4+2];
-    }
+    const inv   = 1 - alpha;
+    out[i*4]   = Math.round(alpha * corrected[i*4]   + inv * targetPixels[i*4]);
+    out[i*4+1] = Math.round(alpha * corrected[i*4+1] + inv * targetPixels[i*4+1]);
+    out[i*4+2] = Math.round(alpha * corrected[i*4+2] + inv * targetPixels[i*4+2]);
     out[i*4+3] = 255;
   }
   return out;
@@ -1012,7 +991,7 @@ export async function transformFrame(jpegBuffer) {
 
   console.log('[Transform] Best face score:', best.score.toFixed(3), 'running inswapper...');
   const { pred, M } = await runSwapper(data, width, height, best.kps, referenceEmbedding);
-  const resultPixels = pasteBack(data, width, height, pred, M, 128, best.kps);
+  const resultPixels = pasteBack(data, width, height, pred, M, 128);
 
   console.log('[Transform] AI output generated, encoding JPEG...');
   return encodeToJPEG(resultPixels, width, height, 85);

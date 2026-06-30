@@ -52,8 +52,9 @@ export const backgroundOptions: BackgroundOption[] = [
 
 const SERVER = 'http://localhost:3001';
 // How often to send frames to the AI server (ms).
-// CPU inference on inswapper takes ~200-500ms per frame, so 3fps balances quality vs lag.
-const TRANSFORM_INTERVAL_MS = 333;
+// Set to 200ms so a new request starts immediately once the previous completes.
+// transformBusyRef prevents queuing — only one in-flight request at a time.
+const TRANSFORM_INTERVAL_MS = 200;
 
 export function useFaceTransform(): UseFaceTransformReturn {
   const [processedStream, setProcessedStream] = useState<MediaStream | null>(null);
@@ -229,7 +230,7 @@ export function useFaceTransform(): UseFaceTransformReturn {
       cap.width = W; cap.height = H;
       cap.getContext('2d')!.drawImage(videoEl, 0, 0, W, H);
 
-      const blob: Blob = await new Promise(res => cap.toBlob(b => res(b!), 'image/jpeg', 0.85));
+      const blob: Blob = await new Promise(res => cap.toBlob(b => res(b!), 'image/jpeg', 0.92));
       console.log('[Transform] Sending frame to AI server, size:', blob.size, 'bytes, dims:', W, 'x', H);
       const form = new FormData();
       form.append('frame', blob, 'frame.jpg');
