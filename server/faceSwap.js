@@ -715,7 +715,7 @@ async function runSwapper(pixels, W, H, kps, srcEmbedding) {
   return { pred: result[outN].data, M, aligned };
 }
 
-// ─── Paste-back with blurred mask and color correction ────────────────────────
+// ─── Paste-back with face-shaped mask and seamless blending ────────────────────
 
 function gaussianBlur1ch(src, w, h, r) {
   const k = r * 2 + 1, sigma = r / 3;
@@ -742,16 +742,43 @@ function gaussianBlur1ch(src, w, h, r) {
 }
 
 /**
+ * Generate an elliptical face mask in the 128x128 canonical space.
+ * This covers the full face region (forehead, cheeks, jaw) without hard rectangular edges.
+ * The mask is then warped back to the original image coordinates.
+ */
+function generateFaceMask(swapSize) {
+  const mask = new Float32Array(swapSize * swapSize);
+  const cx = swapSize / 2;
+  const cy = swapSize / 2;
+  // Ellipse dimensions: wider than tall to cover forehead and jaw
+  const rx = swapSize * 0.42;  // horizontal radius (covers cheeks)
+  const ry = swapSize * 0.48;  // vertical radius (covers forehead to chin)
+
+  for (let y = 0; y < swapSize; y++) {
+    for (let x = 0; x < swapSize; x++) {
+      const dx = (x - cx) / rx;
+      const dy = (y - cy) / ry;
+      const dist = dx * dx + dy * dy;
+      // Smooth falloff from 255 at center to 0 at edge
+      if (dist < 1) {
+        mask[y * swapSize + x] = 255 * (1 - dist * dist);  // Quadratic falloff for smoother edges
+      }
+    }
+  }
+  return mask;
+}
+
+/**
  * Color transfer: adjust swapped face colors to match target face statistics.
- * Uses Reinhard style mean/std transfer in a single pass for performance.
+ * Applies full color correction in the interior, fading only at edges.
  */
 function colorTransfer(warped, target, mask, W, H) {
-  // Single-pass computation of mean and variance for both source and target
+  // Compute mean/std for target face region (where mask > 200)
   let tCount = 0, tSumR = 0, tSumG = 0, tSumB = 0;
   let sCount = 0, sSumR = 0, sSumG = 0, sSumB = 0;
 
   for (let i = 0; i < W * H; i++) {
-    if (mask[i] > 128) {
+    if (mask[i] > 200) {
       tCount++;
       tSumR += target[i*4];
       tSumG += target[i*4+1];
@@ -767,11 +794,11 @@ function colorTransfer(warped, target, mask, W, H) {
   const tMeanR = tSumR / tCount, tMeanG = tSumG / tCount, tMeanB = tSumB / tCount;
   const sMeanR = sSumR / sCount, sMeanG = sSumG / sCount, sMeanB = sSumB / sCount;
 
-  // Second pass for variance (still need this for std)
+  // Second pass for variance
   let tVarR = 0, tVarG = 0, tVarB = 0;
   let sVarR = 0, sVarG = 0, sVarB = 0;
   for (let i = 0; i < W * H; i++) {
-    if (mask[i] > 128) {
+    if (mask[i] > 200) {
       tVarR += (target[i*4] - tMeanR) ** 2;
       tVarG += (target[i*4+1] - tMeanG) ** 2;
       tVarB += (target[i*4+2] - tMeanB) ** 2;
@@ -787,17 +814,16 @@ function colorTransfer(warped, target, mask, W, H) {
   const sStdG = Math.sqrt(sVarG / sCount) + 1e-6;
   const sStdB = Math.sqrt(sVarB / sCount) + 1e-6;
 
-  // Apply color transfer
+  // Apply color transfer - full correction everywhere, no fade based on mask
   const corrected = new Uint8ClampedArray(W * H * 4);
   for (let i = 0; i < W * H; i++) {
-    const m = mask[i] / 255;
-    if (m > 0.01) {
+    if (mask[i] > 10) {
       const r = ((warped[i*4] - sMeanR) / sStdR) * tStdR + tMeanR;
       const g = ((warped[i*4+1] - sMeanG) / sStdG) * tStdG + tMeanG;
       const b = ((warped[i*4+2] - sMeanB) / sStdB) * tStdB + tMeanB;
-      corrected[i*4]   = Math.max(0, Math.min(255, Math.round(m * r + (1 - m) * warped[i*4])));
-      corrected[i*4+1] = Math.max(0, Math.min(255, Math.round(m * g + (1 - m) * warped[i*4+1])));
-      corrected[i*4+2] = Math.max(0, Math.min(255, Math.round(m * b + (1 - m) * warped[i*4+2])));
+      corrected[i*4]   = Math.max(0, Math.min(255, Math.round(r)));
+      corrected[i*4+1] = Math.max(0, Math.min(255, Math.round(g)));
+      corrected[i*4+2] = Math.max(0, Math.min(255, Math.round(b)));
     } else {
       corrected[i*4]   = warped[i*4];
       corrected[i*4+1] = warped[i*4+1];
@@ -808,24 +834,42 @@ function colorTransfer(warped, target, mask, W, H) {
   return corrected;
 }
 
-function pasteBack(targetPixels, W, H, pred, M, swapSize) {
+function pasteBack(targetPixels, W, H, pred, M, swapSize, kps) {
   const fakePx = predToPixels(pred, swapSize);
   const [a, b, tx, c, d, ty] = M;
 
+  // Generate elliptical face mask in canonical 128x128 space
+  const canonicalMask = generateFaceMask(swapSize);
+
   // Backward mapping: for each output pixel (x,y) in the full frame, apply M to get
   // the corresponding canonical position in the 128×128 InSwapper output.
+  // Also warp the face mask from canonical space to image coordinates.
   const warped  = new Uint8ClampedArray(W * H * 4);
   const rawMask = new Float32Array(W * H);
 
+  // Inverse of M for backward mapping
+  const det = a * d - b * c;
+  let ia, ib, itx, ic, id2, ity;
+  if (Math.abs(det) < 1e-10) {
+    ia = 1; ib = 0; itx = 0; ic = 0; id2 = 1; ity = 0;
+  } else {
+    ia = d / det; ib = -b / det; itx = (b * ty - d * tx) / det;
+    ic = -c / det; id2 = a / det; ity = (c * tx - a * ty) / det;
+  }
+
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
+      // Map image coordinates to canonical 128x128 space
       const sx = a * x + b * y + tx;
       const sy = c * x + d * y + ty;
       const x0 = Math.floor(sx), y0 = Math.floor(sy);
       const x1 = x0 + 1,         y1 = y0 + 1;
+
       if (x0 >= 0 && x1 < swapSize && y0 >= 0 && y1 < swapSize) {
         const fx = sx - x0, fy = sy - y0;
         const w00=(1-fx)*(1-fy), w10=fx*(1-fy), w01=(1-fx)*fy, w11=fx*fy;
+
+        // Bilinear sample from swapped face
         const i00=(y0*swapSize+x0)*4, i10=(y0*swapSize+x1)*4;
         const i01=(y1*swapSize+x0)*4, i11=(y1*swapSize+x1)*4;
         const di = (y*W+x)*4;
@@ -833,38 +877,37 @@ function pasteBack(targetPixels, W, H, pred, M, swapSize) {
         warped[di+1] = Math.round(w00*fakePx[i00+1]+w10*fakePx[i10+1]+w01*fakePx[i01+1]+w11*fakePx[i11+1]);
         warped[di+2] = Math.round(w00*fakePx[i00+2]+w10*fakePx[i10+2]+w01*fakePx[i01+2]+w11*fakePx[i11+2]);
         warped[di+3] = 255;
-        rawMask[y*W+x] = 255;
+
+        // Bilinear sample from canonical mask
+        const m00 = canonicalMask[y0*swapSize+x0];
+        const m10 = canonicalMask[y0*swapSize+x1];
+        const m01 = canonicalMask[y1*swapSize+x0];
+        const m11 = canonicalMask[y1*swapSize+x1];
+        rawMask[y*W+x] = w00*m00 + w10*m10 + w01*m01 + w11*m11;
       }
     }
   }
 
-  // Erosion to remove hard boundary
-  const erR = 8;
-  const eroded = new Float32Array(W * H);
-  for (let y = 0; y < H; y++)
-    for (let x = 0; x < W; x++) {
-      let mn = 255;
-      for (let dy = -erR; dy <= erR; dy++)
-        for (let dx = -erR; dx <= erR; dx++) {
-          const v = rawMask[Math.min(H-1,Math.max(0,y+dy))*W + Math.min(W-1,Math.max(0,x+dx))];
-          if (v < mn) mn = v;
-        }
-      eroded[y*W+x] = mn;
-    }
+  // Strong Gaussian blur for very smooth edge blending
+  const blurR = Math.max(15, Math.floor(Math.sqrt(W*H/(480*360))*18));
+  const mask  = gaussianBlur1ch(rawMask, W, H, blurR);
 
-  // Blur for smooth edge blending
-  const blurR = Math.max(10, Math.floor(Math.sqrt(W*H/(480*360))*12));
-  const mask  = gaussianBlur1ch(eroded, W, H, blurR);
-
-  // Apply color transfer to match skin tones
+  // Apply color transfer to match target skin tones and lighting
   const colorCorrected = colorTransfer(warped, targetPixels, mask, W, H);
 
+  // Final blend: swapped face in masked region, original image elsewhere
   const out = new Uint8ClampedArray(W * H * 4);
   for (let i = 0; i < W * H; i++) {
     const alpha = mask[i] / 255;
-    out[i*4]   = Math.round(alpha * colorCorrected[i*4]   + (1-alpha) * targetPixels[i*4]);
-    out[i*4+1] = Math.round(alpha * colorCorrected[i*4+1] + (1-alpha) * targetPixels[i*4+1]);
-    out[i*4+2] = Math.round(alpha * colorCorrected[i*4+2] + (1-alpha) * targetPixels[i*4+2]);
+    if (alpha > 0.001) {
+      out[i*4]   = Math.round(alpha * colorCorrected[i*4]   + (1-alpha) * targetPixels[i*4]);
+      out[i*4+1] = Math.round(alpha * colorCorrected[i*4+1] + (1-alpha) * targetPixels[i*4+1]);
+      out[i*4+2] = Math.round(alpha * colorCorrected[i*4+2] + (1-alpha) * targetPixels[i*4+2]);
+    } else {
+      out[i*4]   = targetPixels[i*4];
+      out[i*4+1] = targetPixels[i*4+1];
+      out[i*4+2] = targetPixels[i*4+2];
+    }
     out[i*4+3] = 255;
   }
   return out;
@@ -969,7 +1012,7 @@ export async function transformFrame(jpegBuffer) {
 
   console.log('[Transform] Best face score:', best.score.toFixed(3), 'running inswapper...');
   const { pred, M } = await runSwapper(data, width, height, best.kps, referenceEmbedding);
-  const resultPixels = pasteBack(data, width, height, pred, M, 128);
+  const resultPixels = pasteBack(data, width, height, pred, M, 128, best.kps);
 
   console.log('[Transform] AI output generated, encoding JPEG...');
   return encodeToJPEG(resultPixels, width, height, 85);
